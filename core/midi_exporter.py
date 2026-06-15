@@ -390,25 +390,84 @@ def _format_section_marker(name: str) -> str:
     return name[0].upper() + name[1:]
 
 
-def _append_section_markers_to_track(
-    track: mido.MidiTrack,
+_TIMELINE_MARKER = 0
+_TIMELINE_LYRIC = 1
+_TIMELINE_NOTE_ON = 2
+_TIMELINE_NOTE_OFF = 3
+
+
+def _build_note_marker_timeline(
+    notes: list[Note],
     sections: list[SongSection],
+    lyrics: dict[NoteSignature, str],
     tick_tempo: int,
-) -> int:
-    """在轨上按 start 时间写入段落 marker，返回写入后的 tick 位置。"""
-    current_ticks = 0
-    for section in sorted(sections, key=lambda item: (item.start, item.seq)):
-        start_ticks = _abs_ticks(section.start, tick_tempo, TICKS_PER_BEAT)
-        delta = max(start_ticks - current_ticks, 0)
-        track.append(
-            mido.MetaMessage(
-                "marker",
-                text=_format_section_marker(section.name),
-                time=delta,
+    *,
+    write_section_markers: bool,
+    write_lyrics: bool,
+    lower_octave: bool,
+) -> list[tuple[int, int, mido.Message | mido.MetaMessage]]:
+    """按绝对 tick 收集 marker 与音符事件，供按时间顺序写入同轨。"""
+    events: list[tuple[int, int, mido.Message | mido.MetaMessage]] = []
+
+    if write_section_markers:
+        for section in sorted(sections, key=lambda item: (item.start, item.seq)):
+            start_ticks = _abs_ticks(section.start, tick_tempo, TICKS_PER_BEAT)
+            events.append(
+                (
+                    start_ticks,
+                    _TIMELINE_MARKER,
+                    mido.MetaMessage(
+                        "marker",
+                        text=_format_section_marker(section.name),
+                        time=0,
+                    ),
+                )
+            )
+
+    for note in sorted(notes, key=lambda n: (n.start, n.end, n.key)):
+        pitch = _midi_pitch(note, lower_octave=lower_octave)
+        start_ticks = _abs_ticks(note.start, tick_tempo, TICKS_PER_BEAT)
+        end_ticks = _abs_ticks(note.end, tick_tempo, TICKS_PER_BEAT)
+        lyric = lyrics.get(_note_signature(note)) if write_lyrics else None
+
+        if lyric is not None:
+            events.append(
+                (
+                    start_ticks,
+                    _TIMELINE_LYRIC,
+                    mido.MetaMessage("lyrics", text=lyric, time=0),
+                )
+            )
+        events.append(
+            (
+                start_ticks,
+                _TIMELINE_NOTE_ON,
+                mido.Message("note_on", note=pitch, velocity=80, time=0),
             )
         )
-        current_ticks = start_ticks
-    return current_ticks
+        events.append(
+            (
+                end_ticks,
+                _TIMELINE_NOTE_OFF,
+                mido.Message("note_off", note=pitch, velocity=0, time=0),
+            )
+        )
+
+    events.sort(key=lambda item: (item[0], item[1]))
+    return events
+
+
+def _append_timeline_to_track(
+    track: mido.MidiTrack,
+    events: list[tuple[int, int, mido.Message | mido.MetaMessage]],
+    *,
+    initial_ticks: int = 0,
+) -> None:
+    current_ticks = initial_ticks
+    for abs_ticks, _, message in events:
+        message.time = max(abs_ticks - current_ticks, 0)
+        track.append(message)
+        current_ticks = abs_ticks
 
 
 def _build_lyrics_only_track(
@@ -488,25 +547,31 @@ def _build_melody_track(
             mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
         )
     track.append(mido.MetaMessage("track_name", name=track_name, time=0))
-    initial_ticks = 0
-    if write_section_markers and song.sections:
-        initial_ticks = _append_section_markers_to_track(
-            track, song.sections, tick_tempo
-        )
     lyric_map = (
         _lyrics_by_signature_for_part(notes, song, part, lyric_granularity)
         if write_lyrics and part in ("A", "B")
         else {}
     )
-    _append_notes_to_track(
-        track,
-        notes,
-        lyric_map,
-        tick_tempo,
-        write_lyrics=write_lyrics,
-        lower_octave=lower_octave,
-        initial_ticks=initial_ticks,
-    )
+    if write_section_markers and song.sections:
+        timeline = _build_note_marker_timeline(
+            notes,
+            song.sections,
+            lyric_map,
+            tick_tempo,
+            write_section_markers=True,
+            write_lyrics=write_lyrics,
+            lower_octave=lower_octave,
+        )
+        _append_timeline_to_track(track, timeline)
+    else:
+        _append_notes_to_track(
+            track,
+            notes,
+            lyric_map,
+            tick_tempo,
+            write_lyrics=write_lyrics,
+            lower_octave=lower_octave,
+        )
     return track
 
 
@@ -591,20 +656,26 @@ def _export_merge_same_track(
             mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
         )
     melody.append(mido.MetaMessage("track_name", name="合并同轨", time=0))
-    initial_ticks = 0
     if write_section_markers and song.sections:
-        initial_ticks = _append_section_markers_to_track(
-            melody, song.sections, tick_tempo
+        timeline = _build_note_marker_timeline(
+            combined,
+            song.sections,
+            lyric_map,
+            tick_tempo,
+            write_section_markers=True,
+            write_lyrics=write_lyrics,
+            lower_octave=lower_octave,
         )
-    _append_notes_to_track(
-        melody,
-        combined,
-        lyric_map,
-        tick_tempo,
-        write_lyrics=write_lyrics,
-        lower_octave=lower_octave,
-        initial_ticks=initial_ticks,
-    )
+        _append_timeline_to_track(melody, timeline)
+    else:
+        _append_notes_to_track(
+            melody,
+            combined,
+            lyric_map,
+            tick_tempo,
+            write_lyrics=write_lyrics,
+            lower_octave=lower_octave,
+        )
 
     midi = mido.MidiFile(type=0, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
     midi.tracks.append(melody)

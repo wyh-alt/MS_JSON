@@ -54,6 +54,7 @@ class ExportWorker(QThread):
         lower_octave: bool,
         write_section_markers: bool,
         exclude_rap_sections: bool,
+        remove_non_melody_notes: bool,
         time_offset_ms: int,
         parent=None,
     ):
@@ -68,6 +69,7 @@ class ExportWorker(QThread):
         self.lower_octave = lower_octave
         self.write_section_markers = write_section_markers
         self.exclude_rap_sections = exclude_rap_sections
+        self.remove_non_melody_notes = remove_non_melody_notes
         self.time_offset_ms = time_offset_ms
 
     def run(self):
@@ -89,6 +91,7 @@ class ExportWorker(QThread):
                     lower_octave=self.lower_octave,
                     write_section_markers=self.write_section_markers,
                     exclude_rap_sections=self.exclude_rap_sections,
+                    remove_non_melody_notes=self.remove_non_melody_notes,
                     time_offset_ms=self.time_offset_ms,
                 )
                 result.success.extend(exported)
@@ -136,12 +139,8 @@ class ExportPage(ScrollArea):
         option_layout.setSpacing(8)
         option_layout.addWidget(StrongBodyLabel("导出选项"))
 
-        option_row = QHBoxLayout()
-        option_row.setSpacing(8)
-        option_row.addWidget(BodyLabel("声部导出:"))
-        self.part_combo = create_compact_combo(option_card, min_width=148, max_width=210)
-        for label, _ in PART_MODE_LABELS:
-            self.part_combo.addItem(label)
+        checkbox_row = QHBoxLayout()
+        checkbox_row.setSpacing(12)
         self.tempo_checkbox = CheckBox("写入速度信息", option_card)
         self.tempo_checkbox.setChecked(False)
         self.lyrics_checkbox = CheckBox("写入歌词", option_card)
@@ -153,14 +152,26 @@ class ExportPage(ScrollArea):
         self.section_marker_checkbox.setChecked(False)
         self.exclude_rap_checkbox = CheckBox("删除Rap段落音符", option_card)
         self.exclude_rap_checkbox.setChecked(False)
-        option_row.addWidget(self.part_combo)
-        option_row.addWidget(self.tempo_checkbox)
-        option_row.addWidget(self.lyrics_checkbox)
-        option_row.addWidget(self.lower_octave_checkbox)
-        option_row.addWidget(self.section_marker_checkbox)
-        option_row.addWidget(self.exclude_rap_checkbox)
-        option_row.addStretch(1)
-        option_layout.addLayout(option_row)
+        self.remove_non_melody_checkbox = CheckBox("删除疑似非旋律音符", option_card)
+        self.remove_non_melody_checkbox.setChecked(False)
+        checkbox_row.addWidget(self.tempo_checkbox)
+        checkbox_row.addWidget(self.lyrics_checkbox)
+        checkbox_row.addWidget(self.lower_octave_checkbox)
+        checkbox_row.addWidget(self.section_marker_checkbox)
+        checkbox_row.addWidget(self.exclude_rap_checkbox)
+        checkbox_row.addWidget(self.remove_non_melody_checkbox)
+        checkbox_row.addStretch(1)
+        option_layout.addLayout(checkbox_row)
+
+        part_row = QHBoxLayout()
+        part_row.setSpacing(8)
+        part_row.addWidget(BodyLabel("声部导出:"))
+        self.part_combo = create_compact_combo(option_card, min_width=148, max_width=210)
+        for label, _ in PART_MODE_LABELS:
+            self.part_combo.addItem(label)
+        part_row.addWidget(self.part_combo)
+        part_row.addStretch(1)
+        option_layout.addLayout(part_row)
 
         self.lyric_options_widget = QWidget(option_card)
         lyric_row = QHBoxLayout(self.lyric_options_widget)
@@ -179,6 +190,7 @@ class ExportPage(ScrollArea):
         )
         for label, _ in LYRIC_GRANULARITY_LABELS:
             self.lyric_granularity_combo.addItem(label)
+        self.lyric_granularity_combo.setCurrentIndex(1)
         lyric_row.addWidget(self.lyric_granularity_combo)
         lyric_row.addStretch(1)
         option_layout.addWidget(self.lyric_options_widget)
@@ -253,6 +265,7 @@ class ExportPage(ScrollArea):
         lower_octave = self.lower_octave_checkbox.isChecked()
         write_section_markers = self.section_marker_checkbox.isChecked()
         exclude_rap_sections = self.exclude_rap_checkbox.isChecked()
+        remove_non_melody_notes = self.remove_non_melody_checkbox.isChecked()
         time_offset_ms = self.offset_spinbox.value()
 
         if not input_path or not os.path.exists(input_path):
@@ -306,6 +319,7 @@ class ExportPage(ScrollArea):
             lower_octave=lower_octave,
             write_section_markers=write_section_markers,
             exclude_rap_sections=exclude_rap_sections,
+            remove_non_melody_notes=remove_non_melody_notes,
             time_offset_ms=time_offset_ms,
         )
         self.worker.progress.connect(self._on_progress)

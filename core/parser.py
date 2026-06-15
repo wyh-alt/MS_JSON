@@ -543,6 +543,209 @@ def _overlaps_time_range(start: int, end: int, range_start: int, range_end: int)
     return start < range_end and end > range_start
 
 
+NON_MELODY_FAR_SEMITONES = 12
+NON_MELODY_REGION_GAP_MS = 150
+
+
+def _note_signature(note: Note) -> tuple[int, int, int]:
+    return note.start, note.end, note.key
+
+
+def _notes_overlapping_section(section: SongSection, notes: list[Note]) -> list[Note]:
+    return [
+        note
+        for note in notes
+        if _overlaps_time_range(note.start, note.end, section.start, section.end)
+    ]
+
+
+def _pitch_core_range(keys: list[int]) -> tuple[int, int]:
+    if not keys:
+        return 60, 72
+    sorted_keys = sorted(keys)
+    q25 = sorted_keys[len(sorted_keys) // 4]
+    q75 = sorted_keys[(len(sorted_keys) * 3) // 4]
+    return q25, q75
+
+
+def _is_pitch_far_from_core_range(pitch: int, q25: int, q75: int) -> bool:
+    return (
+        pitch < q25 - NON_MELODY_FAR_SEMITONES
+        or pitch > q75 + NON_MELODY_FAR_SEMITONES
+    )
+
+
+def _first_content_section_marker_start(song: SongData) -> int | None:
+    """首个有演唱声部（A/B）的段落标记点时间。"""
+    for section in sorted(song.sections, key=lambda item: (item.start, item.seq)):
+        if section.part_a or section.part_b:
+            return section.start
+    if not song.sections:
+        return None
+    return sorted(song.sections, key=lambda item: (item.start, item.seq))[0].start
+
+
+def _protected_pre_marker_note_signatures(song: SongData) -> set[tuple[int, int, int]]:
+    """早于首个内容段落标记的音符不参与非旋律删除（常见为段前 10ms 先行音）。"""
+    marker_start = _first_content_section_marker_start(song)
+    if marker_start is None:
+        return set()
+    return {
+        _note_signature(note)
+        for note in song.notes
+        if note.start < marker_start
+    }
+
+
+def _same_pitch_section_note_signatures(
+    song: SongData,
+    *,
+    protected: set[tuple[int, int, int]],
+) -> set[tuple[int, int, int]]:
+    """段落内全部音符为同一音高。"""
+    marked: set[tuple[int, int, int]] = set()
+    for section in song.sections:
+        section_notes = [
+            note
+            for note in _notes_overlapping_section(section, song.notes)
+            if _note_signature(note) not in protected
+        ]
+        if not section_notes:
+            continue
+        if len({note.key for note in section_notes}) == 1:
+            marked.update(_note_signature(note) for note in section_notes)
+    return marked
+
+
+def _far_flat_region_note_signatures(
+    song: SongData,
+    *,
+    excluded: set[tuple[int, int, int]],
+    protected: set[tuple[int, int, int]],
+) -> set[tuple[int, int, int]]:
+    """连续同音高且偏离整体音域的音符区域（至少 2 个连续音符）。"""
+    notes = sorted(song.notes, key=lambda note: (note.start, note.end, note.key))
+    if not notes:
+        return set()
+
+    q25, q75 = _pitch_core_range([note.key for note in notes])
+    marked: set[tuple[int, int, int]] = set()
+    index = 0
+    while index < len(notes):
+        note = notes[index]
+        signature = _note_signature(note)
+        if signature in excluded or signature in protected:
+            index += 1
+            continue
+
+        run_end = index + 1
+        while run_end < len(notes):
+            previous = notes[run_end - 1]
+            current = notes[run_end]
+            if current.key != note.key:
+                break
+            if current.start - previous.end > NON_MELODY_REGION_GAP_MS:
+                break
+            run_end += 1
+
+        run = notes[index:run_end]
+        if (
+            len(run) >= 2
+            and _is_pitch_far_from_core_range(note.key, q25, q75)
+        ):
+            marked.update(_note_signature(item) for item in run)
+        index = run_end if run_end > index + 1 else index + 1
+    return marked
+
+
+def _merge_time_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        merged[-1] = (prev_start, max(prev_end, end))
+    return merged
+
+
+def _collect_non_melody_note_signatures(song: SongData) -> set[tuple[int, int, int]]:
+    protected = _protected_pre_marker_note_signatures(song)
+    section_flat = _same_pitch_section_note_signatures(song, protected=protected)
+    region_flat = _far_flat_region_note_signatures(
+        song,
+        excluded=section_flat,
+        protected=protected,
+    )
+    return (section_flat | region_flat) - protected
+
+
+def _filter_song_by_removed_note_ranges(
+    song: SongData,
+    removed_ranges: list[tuple[int, int]],
+) -> SongData:
+    if not removed_ranges:
+        return song
+
+    def overlaps_removed(start: int, end: int) -> bool:
+        return any(
+            _overlaps_time_range(start, end, range_start, range_end)
+            for range_start, range_end in removed_ranges
+        )
+
+    return SongData(
+        source_path=song.source_path,
+        mr_id=song.mr_id,
+        title=song.title,
+        title_origin=song.title_origin,
+        title_ko=song.title_ko,
+        title_en=song.title_en,
+        artist_origin=song.artist_origin,
+        artist_ko=song.artist_ko,
+        artist_en=song.artist_en,
+        notes=[note for note in song.notes if not overlaps_removed(note.start, note.end)],
+        words_part_a=[
+            word for word in song.words_part_a if not overlaps_removed(word.start, word.end)
+        ],
+        words_part_b=[
+            word for word in song.words_part_b if not overlaps_removed(word.start, word.end)
+        ],
+        merged_words_part_a=[
+            word
+            for word in song.merged_words_part_a
+            if not overlaps_removed(word.start, word.end)
+        ],
+        merged_words_part_b=[
+            word
+            for word in song.merged_words_part_b
+            if not overlaps_removed(word.start, word.end)
+        ],
+        lines_part_a=[
+            line for line in song.lines_part_a if not overlaps_removed(line.start, line.end)
+        ],
+        lines_part_b=[
+            line for line in song.lines_part_b if not overlaps_removed(line.start, line.end)
+        ],
+        sections=list(song.sections),
+        section_export_infos=list(song.section_export_infos),
+        tempo_bpm=song.tempo_bpm,
+    )
+
+
+def exclude_non_melody_notes_from_song(song: SongData) -> SongData:
+    """移除疑似非旋律音符（同音高段落、偏离音域的连续同音高区域）及对应歌词。"""
+    signatures = _collect_non_melody_note_signatures(song)
+    if not signatures:
+        return song
+
+    removed_ranges = _merge_time_ranges(
+        [(start, end) for start, end, _ in signatures]
+    )
+    return _filter_song_by_removed_note_ranges(song, removed_ranges)
+
+
 def exclude_rap_sections_from_song(song: SongData) -> SongData:
     """移除 Rap 段落内的音符、歌词，并剔除 Rap 段落标记。"""
     rap_ranges = [(section.start, section.end) for section in song.sections if is_rap_section(section)]

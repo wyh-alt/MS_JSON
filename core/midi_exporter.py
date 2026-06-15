@@ -11,6 +11,7 @@ from core.parser import (
     SongData,
     SongSection,
     apply_song_time_offset,
+    exclude_non_melody_notes_from_song,
     exclude_rap_sections_from_song,
     strip_lyric_punctuation,
 )
@@ -379,6 +380,67 @@ def _dedupe_notes(notes: list[Note]) -> list[Note]:
     return unique
 
 
+_TIMELINE_MARKER = 0
+_TIMELINE_LYRIC = 1
+_TIMELINE_NOTE_ON = 2
+_TIMELINE_NOTE_OFF = 3
+
+NOTE_VELOCITY = 100
+
+
+def _new_midi_file() -> mido.MidiFile:
+    return mido.MidiFile(type=1, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
+
+
+def _build_conductor_track(song: SongData, *, write_tempo: bool) -> mido.MidiTrack:
+    """参考 KTV MIDI：独立指挥轨，仅含拍号与速度。"""
+    track = mido.MidiTrack()
+    track.append(
+        mido.MetaMessage(
+            "time_signature",
+            numerator=4,
+            denominator=4,
+            clocks_per_click=24,
+            notated_32nd_notes_per_beat=8,
+            time=0,
+        )
+    )
+    bpm = song.tempo_bpm if write_tempo else DEFAULT_TEMPO_BPM
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(bpm), time=0))
+    track.append(mido.MetaMessage("end_of_track", time=0))
+    return track
+
+
+def _assemble_midi(
+    song: SongData,
+    melody_tracks: list[mido.MidiTrack],
+    *,
+    write_tempo: bool,
+) -> mido.MidiFile:
+    midi = _new_midi_file()
+    midi.tracks.append(_build_conductor_track(song, write_tempo=write_tempo))
+    midi.tracks.extend(melody_tracks)
+    return midi
+
+
+def _format_ktv_lyric_text(text: str) -> str:
+    """参考 KTV MIDI：CJK 单字、延音为 -。"""
+    if text == EXTENSION_SYLLABLE:
+        return EXTENSION_SYLLABLE
+    stripped = text.strip()
+    if not stripped:
+        return text
+    if _CJK_CHAR_RE.search(stripped):
+        for char in stripped:
+            if char.strip():
+                return char
+    return text
+
+
+def _format_ktv_lyric_map(lyrics: dict[NoteSignature, str]) -> dict[NoteSignature, str]:
+    return {signature: _format_ktv_lyric_text(text) for signature, text in lyrics.items()}
+
+
 def _append_lyric_meta(track: mido.MidiTrack, text: str, delta: int) -> None:
     track.append(mido.MetaMessage("lyrics", text=text, time=delta))
 
@@ -388,12 +450,6 @@ def _format_section_marker(name: str) -> str:
     if not name:
         return "Section"
     return name[0].upper() + name[1:]
-
-
-_TIMELINE_MARKER = 0
-_TIMELINE_LYRIC = 1
-_TIMELINE_NOTE_ON = 2
-_TIMELINE_NOTE_OFF = 3
 
 
 def _build_note_marker_timeline(
@@ -442,7 +498,7 @@ def _build_note_marker_timeline(
             (
                 start_ticks,
                 _TIMELINE_NOTE_ON,
-                mido.Message("note_on", note=pitch, velocity=80, time=0),
+                mido.Message("note_on", note=pitch, velocity=NOTE_VELOCITY, time=0),
             )
         )
         events.append(
@@ -488,7 +544,7 @@ def _build_lyrics_only_track(
             current_ticks = max(current_ticks, start_ticks)
             continue
         delta = max(start_ticks - current_ticks, 0)
-        track.append(mido.MetaMessage("lyrics", text=lyric, time=delta))
+        _append_lyric_meta(track, lyric, delta)
         current_ticks = start_ticks
 
     return track
@@ -517,10 +573,14 @@ def _append_notes_to_track(
 
         if lyric is not None:
             _append_lyric_meta(track, lyric, delta_on)
-            track.append(mido.Message("note_on", note=pitch, velocity=80, time=0))
+            track.append(
+                mido.Message("note_on", note=pitch, velocity=NOTE_VELOCITY, time=0)
+            )
             current_ticks = start_ticks
         else:
-            track.append(mido.Message("note_on", note=pitch, velocity=80, time=delta_on))
+            track.append(
+                mido.Message("note_on", note=pitch, velocity=NOTE_VELOCITY, time=delta_on)
+            )
             current_ticks = start_ticks
 
         track.append(mido.Message("note_off", note=pitch, velocity=0, time=duration_ticks))
@@ -536,22 +596,18 @@ def _build_melody_track(
     *,
     write_lyrics: bool,
     lyric_granularity: LyricGranularity,
-    include_tempo: bool,
-    write_tempo: bool,
     lower_octave: bool,
     write_section_markers: bool = False,
 ) -> mido.MidiTrack:
     track = mido.MidiTrack()
-    if include_tempo and write_tempo:
-        track.append(
-            mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
-        )
     track.append(mido.MetaMessage("track_name", name=track_name, time=0))
-    lyric_map = (
-        _lyrics_by_signature_for_part(notes, song, part, lyric_granularity)
-        if write_lyrics and part in ("A", "B")
-        else {}
-    )
+    lyric_map: dict[NoteSignature, str] = {}
+    if write_lyrics and part in ("A", "B"):
+        lyric_map = _format_ktv_lyric_map(
+            _lyrics_by_signature_for_part(notes, song, part, lyric_granularity)
+        )
+    elif write_lyrics and part not in ("A", "B"):
+        lyric_map = {}
     if write_section_markers and song.sections:
         timeline = _build_note_marker_timeline(
             notes,
@@ -607,21 +663,22 @@ def _export_single_part(
         raise ValueError(f"{track_name} 没有可导出的音符")
 
     _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
-    midi = mido.MidiFile(type=0, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
-    midi.tracks.append(
-        _build_melody_track(
-            notes,
-            song,
-            part,
-            tick_tempo,
-            track_name,
-            write_lyrics=write_lyrics and bool(notes),
-            lyric_granularity=lyric_granularity,
-            include_tempo=True,
-            write_tempo=write_tempo,
-            lower_octave=lower_octave,
-            write_section_markers=write_section_markers,
-        )
+    midi = _assemble_midi(
+        song,
+        [
+            _build_melody_track(
+                notes,
+                song,
+                part,
+                tick_tempo,
+                track_name,
+                write_lyrics=write_lyrics and bool(notes),
+                lyric_granularity=lyric_granularity,
+                lower_octave=lower_octave,
+                write_section_markers=write_section_markers,
+            )
+        ],
+        write_tempo=write_tempo,
     )
     return _save_midi(midi, song, output_dir, suffix)
 
@@ -644,17 +701,15 @@ def _export_merge_same_track(
 
     combined = _dedupe_notes(notes_a + notes_b + notes_other)
     lyric_map = (
-        _merge_lyrics_by_signature(song, notes_a, notes_b, lyric_granularity)
+        _format_ktv_lyric_map(
+            _merge_lyrics_by_signature(song, notes_a, notes_b, lyric_granularity)
+        )
         if write_lyrics
         else {}
     )
 
     _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
     melody = mido.MidiTrack()
-    if write_tempo:
-        melody.append(
-            mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
-        )
     melody.append(mido.MetaMessage("track_name", name="合并同轨", time=0))
     if write_section_markers and song.sections:
         timeline = _build_note_marker_timeline(
@@ -677,8 +732,7 @@ def _export_merge_same_track(
             lower_octave=lower_octave,
         )
 
-    midi = mido.MidiFile(type=0, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
-    midi.tracks.append(melody)
+    midi = _assemble_midi(song, [melody], write_tempo=write_tempo)
     return _save_midi(midi, song, output_dir, "合并同轨")
 
 
@@ -699,7 +753,7 @@ def _export_merge_multi_track(
         raise ValueError("没有可导出的音符")
 
     _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
-    midi = mido.MidiFile(type=1, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
+    melody_tracks: list[mido.MidiTrack] = []
 
     part_tracks: list[tuple[list[Note], str, str, bool]] = []
     if notes_a:
@@ -710,8 +764,8 @@ def _export_merge_multi_track(
         part_tracks.append((notes_other, "O", "Other", False))
 
     for index, (notes, part, track_name, part_write_lyrics) in enumerate(part_tracks):
-        is_first_track = index == 0
-        midi.tracks.append(
+        is_first_melody_track = index == 0
+        melody_tracks.append(
             _build_melody_track(
                 notes,
                 song,
@@ -720,13 +774,12 @@ def _export_merge_multi_track(
                 track_name,
                 write_lyrics=part_write_lyrics,
                 lyric_granularity=lyric_granularity,
-                include_tempo=is_first_track,
-                write_tempo=write_tempo,
                 lower_octave=lower_octave,
-                write_section_markers=write_section_markers and is_first_track,
+                write_section_markers=write_section_markers and is_first_melody_track,
             )
         )
 
+    midi = _assemble_midi(song, melody_tracks, write_tempo=write_tempo)
     return _save_midi(midi, song, output_dir, "合并分轨")
 
 
@@ -737,15 +790,18 @@ def export_song(
     *,
     write_tempo: bool = True,
     write_lyrics: bool = True,
-    lyric_granularity: LyricGranularity = "word",
+    lyric_granularity: LyricGranularity = "syllable",
     lower_octave: bool = True,
     write_section_markers: bool = False,
     exclude_rap_sections: bool = False,
+    remove_non_melody_notes: bool = False,
     time_offset_ms: int = 0,
 ) -> list[str]:
     song = apply_song_time_offset(song, time_offset_ms)
     if exclude_rap_sections:
         song = exclude_rap_sections_from_song(song)
+    if remove_non_melody_notes:
+        song = exclude_non_melody_notes_from_song(song)
     if part_mode == "separate":
         if not song.notes:
             raise ValueError("没有可导出的音符")

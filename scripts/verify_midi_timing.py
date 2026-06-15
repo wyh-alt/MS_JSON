@@ -56,6 +56,25 @@ def _track_tempo_us(midi: mido.MidiFile, track_index: int, default_tempo_us: int
     return tempo
 
 
+def _conductor_tempo_us(midi: mido.MidiFile, default_tempo_us: int) -> int:
+    if not midi.tracks:
+        return default_tempo_us
+    return _track_tempo_us(midi, 0, default_tempo_us)
+
+
+def _find_track_index_by_name(midi: mido.MidiFile, name: str) -> int | None:
+    for index, track in enumerate(midi.tracks):
+        track_name = next((msg.name for msg in track if msg.type == "track_name"), "")
+        if track_name == name:
+            return index
+    return None
+
+
+def _first_melody_track_index(midi: mido.MidiFile) -> int:
+    """Type 1 导出：Track 0 为指挥轨，旋律从 Track 1 开始。"""
+    return 1 if len(midi.tracks) > 1 else 0
+
+
 def _expected_notes(song, part_mode: str):
     if part_mode == "merge_same":
         notes_a = filter_notes(song.notes, "A")
@@ -121,9 +140,12 @@ def verify_export(
                         )
 
                 for track_index, track_suffix, expected in part_by_track:
-                    tempo_us = _track_tempo_us(midi, track_index, export_tempo_us)
+                    tempo_us = _conductor_tempo_us(midi, export_tempo_us)
                     events = _read_track_events(midi.tracks[track_index])
-                    markers_on_track = write_section_markers and track_index == 0
+                    first_melody = _first_melody_track_index(midi)
+                    markers_on_track = (
+                        write_section_markers and track_index == first_melody
+                    )
                     _check_events(
                         issues,
                         json_path,
@@ -145,8 +167,9 @@ def verify_export(
                     expected = filter_notes(song.notes, "O")
                 else:
                     continue
-                events = _read_track_events(midi.tracks[0])
-                tempo_us = _track_tempo_us(midi, 0, export_tempo_us)
+                track_index = _first_melody_track_index(midi)
+                events = _read_track_events(midi.tracks[track_index])
+                tempo_us = _conductor_tempo_us(midi, export_tempo_us)
                 _check_events(
                     issues,
                     json_path,
@@ -160,8 +183,9 @@ def verify_export(
                 continue
 
             expected = _expected_notes(song, part_mode)
-            events = _read_track_events(midi.tracks[0])
-            tempo_us = _track_tempo_us(midi, 0, export_tempo_us)
+            track_index = _first_melody_track_index(midi)
+            events = _read_track_events(midi.tracks[track_index])
+            tempo_us = _conductor_tempo_us(midi, export_tempo_us)
             _check_events(
                 issues,
                 json_path,

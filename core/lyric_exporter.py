@@ -10,6 +10,9 @@ from core.parser import (
     LyricWord,
     SongData,
     _contains_cjk,
+    apply_song_time_offset,
+    format_section_display_name,
+    load_song_json,
     resolve_artist,
     resolve_title,
 )
@@ -27,8 +30,8 @@ LYRIC_FORMAT_LABELS: list[tuple[str, LyricFormat, str]] = [
 
 LYRIC_PART_LABELS: list[tuple[str, LyricPart]] = [
     ("全部声部", "all"),
-    ("男声部 (A)", "A"),
-    ("女声部 (B)", "B"),
+    ("A 声部", "A"),
+    ("B 声部", "B"),
 ]
 
 META_LANG_LABELS: list[tuple[str, str]] = [
@@ -40,8 +43,8 @@ META_LANG_LABELS: list[tuple[str, str]] = [
 
 @dataclass
 class KscOptions:
-    char_bracket: bool = False
-    word_bracket: bool = False
+    char_bracket: bool = True
+    word_bracket: bool = True
 
 
 def _sanitize_filename(name: str) -> str:
@@ -56,7 +59,20 @@ def _collect_lines(song: SongData, part: LyricPart) -> list[LyricLine]:
         return list(song.lines_part_b)
     merged = list(song.lines_part_a) + list(song.lines_part_b)
     merged.sort(key=lambda line: (line.start, line.end))
-    return merged
+    return _dedupe_lyric_lines(merged)
+
+
+def _dedupe_lyric_lines(lines: list[LyricLine]) -> list[LyricLine]:
+    """合并全部声部时，合唱等同段落在 A/B 各有一份，按时间轴与文本去重。"""
+    seen: set[tuple[int, int, str]] = set()
+    unique: list[LyricLine] = []
+    for line in lines:
+        key = (line.start, line.end, line.text.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(line)
+    return unique
 
 
 def _format_ksc_time(ms: int) -> str:
@@ -273,7 +289,9 @@ def export_song_lyrics(
     title_lang: str,
     artist_lang: str,
     ksc_options: KscOptions | None = None,
+    time_offset_ms: int = 0,
 ) -> str:
+    song = apply_song_time_offset(song, time_offset_ms)
     content = render_lyrics(
         song,
         lyric_format=lyric_format,
@@ -288,3 +306,105 @@ def export_song_lyrics(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
     return output_path
+
+
+SECTION_EXPORT_HEADERS = (
+    "歌名",
+    "歌手",
+    "段落类型",
+    "起始时间",
+    "结束时间",
+    "首句歌词",
+    "末句歌词",
+)
+
+
+def _format_section_time(ms: int) -> str:
+    return _format_ksc_time(ms)
+
+
+def collect_section_export_rows(
+    song: SongData,
+    *,
+    title_lang: str,
+    artist_lang: str,
+    time_offset_ms: int = 0,
+) -> list[tuple[str, str, str, str, str, str, str]]:
+    song = apply_song_time_offset(song, time_offset_ms)
+    title = resolve_title(song, title_lang)
+    artist = resolve_artist(song, artist_lang) or ""
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
+    for info in song.section_export_infos:
+        rows.append(
+            (
+                title,
+                artist,
+                format_section_display_name(info.name),
+                _format_section_time(info.section_start_ms),
+                _format_section_time(info.section_end_ms),
+                info.first_line_text,
+                info.last_line_text,
+            )
+        )
+    return rows
+
+
+def write_sections_excel(
+    rows: list[tuple[str, str, str, str, str, str, str]],
+    output_dir: str,
+) -> str:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as exc:
+        raise RuntimeError("缺少 openpyxl 依赖，请先安装：pip install openpyxl") from exc
+
+    if not rows:
+        raise ValueError("没有可导出的段落信息")
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "段落信息.xlsx")
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "段落信息"
+    sheet.append(list(SECTION_EXPORT_HEADERS))
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+
+    for row in rows:
+        sheet.append(list(row))
+
+    for column_cells in sheet.columns:
+        max_length = 0
+        column_letter = column_cells[0].column_letter
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+        sheet.column_dimensions[column_letter].width = min(max(max_length + 2, 10), 48)
+
+    workbook.save(output_path)
+    return output_path
+
+
+def export_sections_excel(
+    json_paths: list[str],
+    output_dir: str,
+    *,
+    lyric_field: str,
+    title_lang: str,
+    artist_lang: str,
+    time_offset_ms: int = 0,
+) -> str:
+    all_rows: list[tuple[str, str, str, str, str, str, str]] = []
+    for path in json_paths:
+        song = load_song_json(path, lyric_field)
+        all_rows.extend(
+            collect_section_export_rows(
+                song,
+                title_lang=title_lang,
+                artist_lang=artist_lang,
+                time_offset_ms=time_offset_ms,
+            )
+        )
+    return write_sections_excel(all_rows, output_dir)

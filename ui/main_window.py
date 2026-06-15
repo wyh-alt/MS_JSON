@@ -7,7 +7,6 @@ from qfluentwidgets import (
     BodyLabel,
     CardWidget,
     CheckBox,
-    ComboBox,
     FluentIcon as FIF,
     FluentWindow,
     InfoBar,
@@ -22,7 +21,7 @@ from qfluentwidgets import (
 
 from core.midi_exporter import LYRIC_GRANULARITY_LABELS, PART_MODE_LABELS, export_song
 from core.parser import collect_json_files, load_song_json
-from ui.widgets import DragLineEdit
+from ui.widgets import DragLineEdit, create_compact_combo, create_offset_spinbox
 
 LYRIC_FIELD_OPTIONS = [
     ("原文歌词", "ori"),
@@ -53,6 +52,9 @@ class ExportWorker(QThread):
         write_lyrics: bool,
         lyric_granularity: str,
         lower_octave: bool,
+        write_section_markers: bool,
+        exclude_rap_sections: bool,
+        time_offset_ms: int,
         parent=None,
     ):
         super().__init__(parent)
@@ -64,6 +66,9 @@ class ExportWorker(QThread):
         self.write_lyrics = write_lyrics
         self.lyric_granularity = lyric_granularity
         self.lower_octave = lower_octave
+        self.write_section_markers = write_section_markers
+        self.exclude_rap_sections = exclude_rap_sections
+        self.time_offset_ms = time_offset_ms
 
     def run(self):
         result = ExportResult(success=[], failed=[], skipped=0)
@@ -82,6 +87,9 @@ class ExportWorker(QThread):
                     write_lyrics=self.write_lyrics,
                     lyric_granularity=self.lyric_granularity,
                     lower_octave=self.lower_octave,
+                    write_section_markers=self.write_section_markers,
+                    exclude_rap_sections=self.exclude_rap_sections,
+                    time_offset_ms=self.time_offset_ms,
                 )
                 result.success.extend(exported)
             except Exception as exc:
@@ -125,39 +133,65 @@ class ExportPage(ScrollArea):
 
         option_card = CardWidget(container)
         option_layout = QVBoxLayout(option_card)
+        option_layout.setSpacing(8)
         option_layout.addWidget(StrongBodyLabel("导出选项"))
 
         option_row = QHBoxLayout()
+        option_row.setSpacing(8)
         option_row.addWidget(BodyLabel("声部导出:"))
-        self.part_combo = ComboBox(option_card)
+        self.part_combo = create_compact_combo(option_card, min_width=148, max_width=210)
         for label, _ in PART_MODE_LABELS:
             self.part_combo.addItem(label)
         self.tempo_checkbox = CheckBox("写入速度信息", option_card)
         self.tempo_checkbox.setChecked(False)
         self.lyrics_checkbox = CheckBox("写入歌词", option_card)
         self.lyrics_checkbox.setChecked(True)
+        self.lyrics_checkbox.toggled.connect(self._update_lyric_option_visibility)
         self.lower_octave_checkbox = CheckBox("音符降低八度", option_card)
         self.lower_octave_checkbox.setChecked(True)
+        self.section_marker_checkbox = CheckBox("写入段落标记", option_card)
+        self.section_marker_checkbox.setChecked(False)
+        self.exclude_rap_checkbox = CheckBox("删除Rap段落音符", option_card)
+        self.exclude_rap_checkbox.setChecked(False)
         option_row.addWidget(self.part_combo)
         option_row.addWidget(self.tempo_checkbox)
         option_row.addWidget(self.lyrics_checkbox)
         option_row.addWidget(self.lower_octave_checkbox)
+        option_row.addWidget(self.section_marker_checkbox)
+        option_row.addWidget(self.exclude_rap_checkbox)
         option_row.addStretch(1)
         option_layout.addLayout(option_row)
 
-        lyric_row = QHBoxLayout()
-        lyric_row.addWidget(BodyLabel("歌词内容:"))
-        self.lyric_combo = ComboBox(option_card)
+        self.lyric_options_widget = QWidget(option_card)
+        lyric_row = QHBoxLayout(self.lyric_options_widget)
+        lyric_row.setContentsMargins(0, 0, 0, 0)
+        lyric_row.setSpacing(8)
+        lyric_row.addWidget(BodyLabel("歌词内容:", self.lyric_options_widget))
+        self.lyric_combo = create_compact_combo(
+            self.lyric_options_widget, min_width=96, max_width=120
+        )
         for label, _ in LYRIC_FIELD_OPTIONS:
             self.lyric_combo.addItem(label)
         lyric_row.addWidget(self.lyric_combo)
-        lyric_row.addWidget(BodyLabel("歌词粒度:"))
-        self.lyric_granularity_combo = ComboBox(option_card)
+        lyric_row.addWidget(BodyLabel("歌词粒度:", self.lyric_options_widget))
+        self.lyric_granularity_combo = create_compact_combo(
+            self.lyric_options_widget, min_width=168, max_width=228
+        )
         for label, _ in LYRIC_GRANULARITY_LABELS:
             self.lyric_granularity_combo.addItem(label)
         lyric_row.addWidget(self.lyric_granularity_combo)
         lyric_row.addStretch(1)
-        option_layout.addLayout(lyric_row)
+        option_layout.addWidget(self.lyric_options_widget)
+        self._update_lyric_option_visibility(self.lyrics_checkbox.isChecked())
+
+        offset_row = QHBoxLayout()
+        offset_row.setSpacing(8)
+        offset_row.addWidget(BodyLabel("整体偏移:"))
+        self.offset_spinbox = create_offset_spinbox(option_card)
+        offset_row.addWidget(self.offset_spinbox)
+        offset_row.addWidget(BodyLabel("正数向后，负数向前"))
+        offset_row.addStretch(1)
+        option_layout.addLayout(offset_row)
         layout.addWidget(option_card)
 
         output_card = CardWidget(container)
@@ -182,6 +216,9 @@ class ExportPage(ScrollArea):
         layout.addStretch(1)
 
         self.worker: ExportWorker | None = None
+
+    def _update_lyric_option_visibility(self, checked: bool):
+        self.lyric_options_widget.setVisible(checked)
 
     def _browse_input(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -214,6 +251,9 @@ class ExportPage(ScrollArea):
             self.lyric_granularity_combo.currentIndex()
         ][1]
         lower_octave = self.lower_octave_checkbox.isChecked()
+        write_section_markers = self.section_marker_checkbox.isChecked()
+        exclude_rap_sections = self.exclude_rap_checkbox.isChecked()
+        time_offset_ms = self.offset_spinbox.value()
 
         if not input_path or not os.path.exists(input_path):
             InfoBar.warning(
@@ -264,6 +304,9 @@ class ExportPage(ScrollArea):
             write_lyrics=write_lyrics,
             lyric_granularity=lyric_granularity,
             lower_octave=lower_octave,
+            write_section_markers=write_section_markers,
+            exclude_rap_sections=exclude_rap_sections,
+            time_offset_ms=time_offset_ms,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
@@ -311,7 +354,8 @@ class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MS JSON 导出工具")
-        self.resize(900, 640)
+        self.resize(1000, 600)
+        self.setMinimumSize(1000, 600)
 
         icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icon.ico")
         if os.path.exists(icon_path):

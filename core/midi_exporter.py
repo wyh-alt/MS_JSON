@@ -1,11 +1,19 @@
 import os
 import re
-import unicodedata
 from typing import Literal
 
 import mido
 
-from core.parser import LyricWord, MergedLyricWord, Note, SongData
+from core.parser import (
+    LyricWord,
+    MergedLyricWord,
+    Note,
+    SongData,
+    SongSection,
+    apply_song_time_offset,
+    exclude_rap_sections_from_song,
+    strip_lyric_punctuation,
+)
 
 TICKS_PER_BEAT = 480
 DEFAULT_TEMPO_BPM = 120.0
@@ -24,11 +32,11 @@ PartMode = Literal[
 LyricGranularity = Literal["syllable", "word"]
 
 PART_MODE_LABELS: list[tuple[str, PartMode]] = [
-    ("男女声部合并导出（同轨）", "merge_same"),
-    ("男女声部合并导出（分轨）", "merge_multi"),
-    ("男女声部分别导出", "separate"),
-    ("仅男声部", "male_only"),
-    ("仅女声部", "female_only"),
+    ("合并导出（同轨）", "merge_same"),
+    ("合并导出（分轨）", "merge_multi"),
+    ("分别导出", "separate"),
+    ("仅A声部", "male_only"),
+    ("仅B声部", "female_only"),
 ]
 
 LYRIC_GRANULARITY_LABELS: list[tuple[str, LyricGranularity]] = [
@@ -64,6 +72,8 @@ def filter_notes(notes: list[Note], part: str) -> list[Note]:
         return [n for n in notes if n.is_part_a]
     if part == "B":
         return [n for n in notes if n.is_part_b]
+    if part == "O":
+        return [n for n in notes if not n.is_part_a and not n.is_part_b]
     raise ValueError(f"未知声部: {part}")
 
 
@@ -128,24 +138,8 @@ def _match_word_to_notes(word: LyricWord, sorted_notes: list[Note]) -> list[Note
     return [best]
 
 
-_APOSTROPHES = frozenset("'’‘ʼ")
-# ~ 等装饰符号在 Unicode 中常为 Sm，需显式列入
-_EXPLICIT_LYRIC_PUNCT = frozenset(
-    "~～!！?？…·•@#$%^&*()（）[]{}|\\/<>`+=，,。.．；;：:「」『』【】_—－-"
-)
-
-
 def _strip_lyric_punctuation(text: str) -> str:
-    """去除歌词标点（如 ~ ！），保留撇号用于缩写；不处理延音标记 -。"""
-    chars: list[str] = []
-    for ch in text:
-        if ch in _APOSTROPHES:
-            chars.append(ch)
-        elif ch in _EXPLICIT_LYRIC_PUNCT or unicodedata.category(ch).startswith("P"):
-            continue
-        else:
-            chars.append(ch)
-    return re.sub(r" +", " ", "".join(chars)).strip()
+    return strip_lyric_punctuation(text)
 
 
 def _normalize_lyric_text(text: str) -> str | None:
@@ -389,6 +383,34 @@ def _append_lyric_meta(track: mido.MidiTrack, text: str, delta: int) -> None:
     track.append(mido.MetaMessage("lyrics", text=text, time=delta))
 
 
+def _format_section_marker(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return "Section"
+    return name[0].upper() + name[1:]
+
+
+def _append_section_markers_to_track(
+    track: mido.MidiTrack,
+    sections: list[SongSection],
+    tick_tempo: int,
+) -> int:
+    """在轨上按 start 时间写入段落 marker，返回写入后的 tick 位置。"""
+    current_ticks = 0
+    for section in sorted(sections, key=lambda item: (item.start, item.seq)):
+        start_ticks = _abs_ticks(section.start, tick_tempo, TICKS_PER_BEAT)
+        delta = max(start_ticks - current_ticks, 0)
+        track.append(
+            mido.MetaMessage(
+                "marker",
+                text=_format_section_marker(section.name),
+                time=delta,
+            )
+        )
+        current_ticks = start_ticks
+    return current_ticks
+
+
 def _build_lyrics_only_track(
     notes: list[Note],
     lyrics: dict[NoteSignature, str],
@@ -421,9 +443,10 @@ def _append_notes_to_track(
     *,
     write_lyrics: bool,
     lower_octave: bool,
+    initial_ticks: int = 0,
 ) -> None:
     notes = sorted(notes, key=lambda n: (n.start, n.end, n.key))
-    current_ticks = 0
+    current_ticks = initial_ticks
 
     for note in notes:
         pitch = _midi_pitch(note, lower_octave=lower_octave)
@@ -457,6 +480,7 @@ def _build_melody_track(
     include_tempo: bool,
     write_tempo: bool,
     lower_octave: bool,
+    write_section_markers: bool = False,
 ) -> mido.MidiTrack:
     track = mido.MidiTrack()
     if include_tempo and write_tempo:
@@ -464,13 +488,24 @@ def _build_melody_track(
             mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
         )
     track.append(mido.MetaMessage("track_name", name=track_name, time=0))
+    initial_ticks = 0
+    if write_section_markers and song.sections:
+        initial_ticks = _append_section_markers_to_track(
+            track, song.sections, tick_tempo
+        )
     lyric_map = (
         _lyrics_by_signature_for_part(notes, song, part, lyric_granularity)
-        if write_lyrics
+        if write_lyrics and part in ("A", "B")
         else {}
     )
     _append_notes_to_track(
-        track, notes, lyric_map, tick_tempo, write_lyrics=write_lyrics, lower_octave=lower_octave
+        track,
+        notes,
+        lyric_map,
+        tick_tempo,
+        write_lyrics=write_lyrics,
+        lower_octave=lower_octave,
+        initial_ticks=initial_ticks,
     )
     return track
 
@@ -499,9 +534,11 @@ def _export_single_part(
     write_lyrics: bool,
     lyric_granularity: LyricGranularity,
     lower_octave: bool,
+    write_section_markers: bool,
+    allow_empty: bool = False,
 ) -> str:
     notes = filter_notes(song.notes, part)
-    if not notes:
+    if not notes and not allow_empty:
         raise ValueError(f"{track_name} 没有可导出的音符")
 
     _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
@@ -513,11 +550,12 @@ def _export_single_part(
             part,
             tick_tempo,
             track_name,
-            write_lyrics=write_lyrics,
+            write_lyrics=write_lyrics and bool(notes),
             lyric_granularity=lyric_granularity,
             include_tempo=True,
             write_tempo=write_tempo,
             lower_octave=lower_octave,
+            write_section_markers=write_section_markers,
         )
     )
     return _save_midi(midi, song, output_dir, suffix)
@@ -531,13 +569,15 @@ def _export_merge_same_track(
     write_lyrics: bool,
     lyric_granularity: LyricGranularity,
     lower_octave: bool,
+    write_section_markers: bool,
 ) -> str:
     notes_a = filter_notes(song.notes, "A")
     notes_b = filter_notes(song.notes, "B")
-    if not notes_a and not notes_b:
+    notes_other = filter_notes(song.notes, "O")
+    if not notes_a and not notes_b and not notes_other:
         raise ValueError("没有可导出的音符")
 
-    combined = _dedupe_notes(notes_a + notes_b)
+    combined = _dedupe_notes(notes_a + notes_b + notes_other)
     lyric_map = (
         _merge_lyrics_by_signature(song, notes_a, notes_b, lyric_granularity)
         if write_lyrics
@@ -551,6 +591,11 @@ def _export_merge_same_track(
             mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
         )
     melody.append(mido.MetaMessage("track_name", name="合并同轨", time=0))
+    initial_ticks = 0
+    if write_section_markers and song.sections:
+        initial_ticks = _append_section_markers_to_track(
+            melody, song.sections, tick_tempo
+        )
     _append_notes_to_track(
         melody,
         combined,
@@ -558,15 +603,11 @@ def _export_merge_same_track(
         tick_tempo,
         write_lyrics=write_lyrics,
         lower_octave=lower_octave,
+        initial_ticks=initial_ticks,
     )
 
-    if write_lyrics and lyric_map:
-        midi = mido.MidiFile(type=1, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
-        midi.tracks.append(_build_lyrics_only_track(combined, lyric_map, tick_tempo))
-        midi.tracks.append(melody)
-    else:
-        midi = mido.MidiFile(type=0, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
-        midi.tracks.append(melody)
+    midi = mido.MidiFile(type=0, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
+    midi.tracks.append(melody)
     return _save_midi(midi, song, output_dir, "合并同轨")
 
 
@@ -578,51 +619,40 @@ def _export_merge_multi_track(
     write_lyrics: bool,
     lyric_granularity: LyricGranularity,
     lower_octave: bool,
+    write_section_markers: bool,
 ) -> str:
     notes_a = filter_notes(song.notes, "A")
     notes_b = filter_notes(song.notes, "B")
-    if not notes_a and not notes_b:
+    notes_other = filter_notes(song.notes, "O")
+    if not notes_a and not notes_b and not notes_other:
         raise ValueError("没有可导出的音符")
 
     _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
     midi = mido.MidiFile(type=1, ticks_per_beat=TICKS_PER_BEAT, charset="utf-8")
 
-    conductor = mido.MidiTrack()
-    if write_tempo:
-        conductor.append(
-            mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(song.tempo_bpm), time=0)
-        )
-    conductor.append(mido.MetaMessage("track_name", name="Conductor", time=0))
-    midi.tracks.append(conductor)
-
+    part_tracks: list[tuple[list[Note], str, str, bool]] = []
     if notes_a:
-        midi.tracks.append(
-            _build_melody_track(
-                notes_a,
-                song,
-                "A",
-                tick_tempo,
-                "男声部",
-                write_lyrics=write_lyrics,
-                lyric_granularity=lyric_granularity,
-                include_tempo=False,
-                write_tempo=write_tempo,
-                lower_octave=lower_octave,
-            )
-        )
+        part_tracks.append((notes_a, "A", "A声部", write_lyrics))
     if notes_b:
+        part_tracks.append((notes_b, "B", "B声部", write_lyrics))
+    if notes_other:
+        part_tracks.append((notes_other, "O", "Other", False))
+
+    for index, (notes, part, track_name, part_write_lyrics) in enumerate(part_tracks):
+        is_first_track = index == 0
         midi.tracks.append(
             _build_melody_track(
-                notes_b,
+                notes,
                 song,
-                "B",
+                part,
                 tick_tempo,
-                "女声部",
-                write_lyrics=write_lyrics,
+                track_name,
+                write_lyrics=part_write_lyrics,
                 lyric_granularity=lyric_granularity,
-                include_tempo=False,
+                include_tempo=is_first_track,
                 write_tempo=write_tempo,
                 lower_octave=lower_octave,
+                write_section_markers=write_section_markers and is_first_track,
             )
         )
 
@@ -638,40 +668,38 @@ def export_song(
     write_lyrics: bool = True,
     lyric_granularity: LyricGranularity = "word",
     lower_octave: bool = True,
+    write_section_markers: bool = False,
+    exclude_rap_sections: bool = False,
+    time_offset_ms: int = 0,
 ) -> list[str]:
+    song = apply_song_time_offset(song, time_offset_ms)
+    if exclude_rap_sections:
+        song = exclude_rap_sections_from_song(song)
     if part_mode == "separate":
-        exported: list[str] = []
-        if filter_notes(song.notes, "A"):
-            exported.append(
-                _export_single_part(
-                    song,
-                    output_dir,
-                    "A",
-                    "男声部",
-                    "男声部",
-                    write_tempo=write_tempo,
-                    write_lyrics=write_lyrics,
-                    lyric_granularity=lyric_granularity,
-                    lower_octave=lower_octave,
-                )
-            )
-        if filter_notes(song.notes, "B"):
-            exported.append(
-                _export_single_part(
-                    song,
-                    output_dir,
-                    "B",
-                    "女声部",
-                    "女声部",
-                    write_tempo=write_tempo,
-                    write_lyrics=write_lyrics,
-                    lyric_granularity=lyric_granularity,
-                    lower_octave=lower_octave,
-                )
-            )
-        if not exported:
+        if not song.notes:
             raise ValueError("没有可导出的音符")
-        return exported
+
+        separate_parts: list[tuple[str, str, str, bool]] = [
+            ("A", "A声部", "A声部", write_lyrics),
+            ("B", "B声部", "B声部", write_lyrics),
+            ("O", "Other", "Other", False),
+        ]
+        return [
+            _export_single_part(
+                song,
+                output_dir,
+                part,
+                suffix,
+                track_name,
+                write_tempo=write_tempo,
+                write_lyrics=part_write_lyrics,
+                lyric_granularity=lyric_granularity,
+                lower_octave=lower_octave,
+                write_section_markers=write_section_markers,
+                allow_empty=True,
+            )
+            for part, suffix, track_name, part_write_lyrics in separate_parts
+        ]
 
     if part_mode == "male_only":
         return [
@@ -679,12 +707,13 @@ def export_song(
                 song,
                 output_dir,
                 "A",
-                "男声部",
-                "男声部",
+                "A声部",
+                "A声部",
                 write_tempo=write_tempo,
                 write_lyrics=write_lyrics,
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,
+                write_section_markers=write_section_markers,
             )
         ]
 
@@ -694,12 +723,13 @@ def export_song(
                 song,
                 output_dir,
                 "B",
-                "女声部",
-                "女声部",
+                "B声部",
+                "B声部",
                 write_tempo=write_tempo,
                 write_lyrics=write_lyrics,
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,
+                write_section_markers=write_section_markers,
             )
         ]
 
@@ -712,6 +742,7 @@ def export_song(
                 write_lyrics=write_lyrics,
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,
+                write_section_markers=write_section_markers,
             )
         ]
 
@@ -724,6 +755,7 @@ def export_song(
                 write_lyrics=write_lyrics,
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,
+                write_section_markers=write_section_markers,
             )
         ]
 

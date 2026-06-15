@@ -1,10 +1,40 @@
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
 _CJK_CHAR_RE = re.compile(r"[가-힣一-龥ぁ-んァ-ン]")
+_RAP_SECTION_NAME_RE = re.compile(r"^rap\d*$", re.IGNORECASE)
+_APOSTROPHES = frozenset("'’‘ʼ")
+_EXPLICIT_LYRIC_PUNCT = frozenset(
+    "~～!！?？…·•@#$%^&*()（）[]{}|\\/<>`+=，,。.．；;：:「」『』【】_—－-"
+)
+
+
+def strip_lyric_punctuation(text: str) -> str:
+    """去除歌词无意义标点（如 ~ ！），保留撇号用于缩写。"""
+    chars: list[str] = []
+    for ch in text:
+        if ch in _APOSTROPHES:
+            chars.append(ch)
+        elif ch in _EXPLICIT_LYRIC_PUNCT or unicodedata.category(ch).startswith("P"):
+            continue
+        else:
+            chars.append(ch)
+    return re.sub(r" +", " ", "".join(chars)).strip()
+
+
+def normalize_lyric_text(text: str) -> str | None:
+    """解析歌词字段：去标点并保留英文词尾空格。"""
+    if not text or not text.strip():
+        return None
+    trailing_space = text.endswith(" ")
+    core = strip_lyric_punctuation(text)
+    if not core:
+        return None
+    return core + (" " if trailing_space else "")
 
 
 @dataclass
@@ -40,6 +70,27 @@ class LyricLine:
 
 
 @dataclass
+class SongSection:
+    name: str
+    start: int
+    end: int
+    seq: int = 0
+    part_a: bool = False
+    part_b: bool = False
+    highlight: bool = False
+
+
+@dataclass
+class SectionExportInfo:
+    name: str
+    seq: int
+    section_start_ms: int
+    section_end_ms: int
+    first_line_text: str
+    last_line_text: str
+
+
+@dataclass
 class SongData:
     source_path: str
     mr_id: int
@@ -57,6 +108,8 @@ class SongData:
     merged_words_part_b: list[MergedLyricWord] = field(default_factory=list)
     lines_part_a: list[LyricLine] = field(default_factory=list)
     lines_part_b: list[LyricLine] = field(default_factory=list)
+    sections: list[SongSection] = field(default_factory=list)
+    section_export_infos: list[SectionExportInfo] = field(default_factory=list)
     tempo_bpm: float = 120.0
 
 
@@ -111,8 +164,8 @@ def _extract_words(sections: list[dict], part_key: str, lyric_field: str) -> lis
             continue
         for line in section.get("line", []):
             for word in line.get("word", []):
-                text = str(word.get(lyric_field, ""))
-                if not text.strip():
+                text = normalize_lyric_text(str(word.get(lyric_field, "")))
+                if text is None:
                     continue
                 words.append(
                     LyricWord(
@@ -134,11 +187,11 @@ def _append_cjk_word_groups(
     word: dict,
     lyric_field: str,
 ) -> None:
-    text = str(word.get(lyric_field, ""))
-    if not text.strip():
+    text = normalize_lyric_text(str(word.get(lyric_field, "")))
+    if text is None:
         return
     start, end = int(word["start"]), int(word["end"])
-    chars = [ch for ch in text.strip() if ch.strip()]
+    chars = [ch for ch in text if ch.strip() and strip_lyric_punctuation(ch)]
     if not chars:
         return
     if len(chars) == 1:
@@ -192,8 +245,8 @@ def _extract_merged_words(
                 buffer_end = None
 
             for word in line.get("word", []):
-                text = str(word.get(lyric_field, ""))
-                if not text.strip():
+                text = normalize_lyric_text(str(word.get(lyric_field, "")))
+                if text is None:
                     continue
                 if _contains_cjk(text):
                     flush()
@@ -218,9 +271,15 @@ def _extract_merged_words(
 
 
 def _split_cjk_chars(word: LyricWord) -> list[LyricWord]:
-    chars = [ch for ch in word.text.strip() if ch.strip()]
-    if len(chars) <= 1:
-        return [LyricWord(word.start, word.end, chars[0] if chars else word.text.strip())]
+    chars = [
+        ch
+        for ch in word.text
+        if ch.strip() and strip_lyric_punctuation(ch)
+    ]
+    if not chars:
+        return []
+    if len(chars) == 1:
+        return [LyricWord(word.start, word.end, chars[0])]
     duration = max(1, word.end - word.start)
     result: list[LyricWord] = []
     for index, char in enumerate(chars):
@@ -289,8 +348,8 @@ def _extract_lines(sections: list[dict], part_key: str, lyric_field: str) -> lis
         for line in section.get("line", []):
             syllables: list[LyricWord] = []
             for word in line.get("word", []):
-                text = str(word.get(lyric_field, ""))
-                if not text.strip():
+                text = normalize_lyric_text(str(word.get(lyric_field, "")))
+                if text is None:
                     continue
                 syllables.append(
                     LyricWord(
@@ -320,6 +379,267 @@ def _parse_tempo(tempos: list[dict]) -> float:
     if not tempos:
         return 120.0
     return float(tempos[0].get("tempo", 120.0))
+
+
+def _parse_sections(raw_sections: list[dict]) -> list[SongSection]:
+    sections: list[SongSection] = []
+    for section in raw_sections:
+        name = str(section.get("name", "") or "").strip()
+        if not name:
+            continue
+        sections.append(
+            SongSection(
+                name=name,
+                start=int(section.get("start", 0)),
+                end=int(section.get("end", 0)),
+                seq=int(section.get("seq", 0)),
+                part_a=bool(section.get("partA")),
+                part_b=bool(section.get("partB")),
+                highlight=bool(section.get("highlight")),
+            )
+        )
+    sections.sort(key=lambda item: (item.seq, item.start, item.end))
+    return sections
+
+
+def format_section_display_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return "Section"
+    return name[0].upper() + name[1:]
+
+
+def _parse_section_line(line: dict, lyric_field: str) -> LyricLine | None:
+    syllables: list[LyricWord] = []
+    for word in line.get("word", []):
+        text = normalize_lyric_text(str(word.get(lyric_field, "")))
+        if text is None:
+            continue
+        syllables.append(
+            LyricWord(
+                start=int(word["start"]),
+                end=int(word["end"]),
+                text=text,
+            )
+        )
+    if not syllables:
+        return None
+    units = _syllables_to_units(syllables)
+    if not units:
+        return None
+    return LyricLine(
+        start=int(line.get("start", syllables[0].start)),
+        end=int(line.get("end", syllables[-1].end)),
+        text=_units_to_line_text(units),
+        units=units,
+    )
+
+
+def extract_section_export_infos(
+    sections: list[dict], lyric_field: str
+) -> list[SectionExportInfo]:
+    infos: list[SectionExportInfo] = []
+    for section in sections:
+        name = str(section.get("name", "") or "").strip()
+        if not name:
+            continue
+        section_start_ms = int(section.get("start", 0))
+        section_end_ms = int(section.get("end", 0))
+        parsed_lines: list[LyricLine] = []
+        for line in section.get("line", []):
+            parsed = _parse_section_line(line, lyric_field)
+            if parsed is not None:
+                parsed_lines.append(parsed)
+
+        first_line_text = parsed_lines[0].text if parsed_lines else ""
+        last_line_text = parsed_lines[-1].text if parsed_lines else ""
+        infos.append(
+            SectionExportInfo(
+                name=name,
+                seq=int(section.get("seq", 0)),
+                section_start_ms=section_start_ms,
+                section_end_ms=section_end_ms,
+                first_line_text=first_line_text,
+                last_line_text=last_line_text,
+            )
+        )
+    infos.sort(key=lambda item: (item.seq, item.section_start_ms))
+    return infos
+
+
+def shift_time_ms(time_ms: int, offset_ms: int) -> int:
+    """整体时间偏移（毫秒）；正数向后，负数向前，结果不小于 0。"""
+    if offset_ms == 0:
+        return time_ms
+    return max(0, time_ms + offset_ms)
+
+
+def _shift_time_range(start: int, end: int, offset_ms: int) -> tuple[int, int]:
+    shifted_start = shift_time_ms(start, offset_ms)
+    shifted_end = shift_time_ms(end, offset_ms)
+    if shifted_end <= shifted_start:
+        shifted_end = shifted_start + 1
+    return shifted_start, shifted_end
+
+
+def _shift_lyric_word(word: LyricWord, offset_ms: int) -> LyricWord:
+    start, end = _shift_time_range(word.start, word.end, offset_ms)
+    return LyricWord(start=start, end=end, text=word.text)
+
+
+def _shift_merged_word(word: MergedLyricWord, offset_ms: int) -> MergedLyricWord:
+    start, end = _shift_time_range(word.start, word.end, offset_ms)
+    return MergedLyricWord(
+        start=start,
+        end=end,
+        text=word.text,
+        syllables=[_shift_lyric_word(syllable, offset_ms) for syllable in word.syllables],
+    )
+
+
+def _shift_lyric_line(line: LyricLine, offset_ms: int) -> LyricLine:
+    start, end = _shift_time_range(line.start, line.end, offset_ms)
+    return LyricLine(
+        start=start,
+        end=end,
+        text=line.text,
+        units=[_shift_lyric_word(unit, offset_ms) for unit in line.units],
+    )
+
+
+def _shift_section(section: SongSection, offset_ms: int) -> SongSection:
+    start, end = _shift_time_range(section.start, section.end, offset_ms)
+    return SongSection(
+        name=section.name,
+        start=start,
+        end=end,
+        seq=section.seq,
+        part_a=section.part_a,
+        part_b=section.part_b,
+        highlight=section.highlight,
+    )
+
+
+def _shift_note(note: Note, offset_ms: int) -> Note:
+    start, end = _shift_time_range(note.start, note.end, offset_ms)
+    return Note(
+        start=start,
+        end=end,
+        key=note.key,
+        is_part_a=note.is_part_a,
+        is_part_b=note.is_part_b,
+    )
+
+
+def is_rap_section_name(name: str) -> bool:
+    return bool(_RAP_SECTION_NAME_RE.match(name.strip()))
+
+
+def is_rap_section(section: SongSection) -> bool:
+    return is_rap_section_name(section.name)
+
+
+def _overlaps_time_range(start: int, end: int, range_start: int, range_end: int) -> bool:
+    return start < range_end and end > range_start
+
+
+def exclude_rap_sections_from_song(song: SongData) -> SongData:
+    """移除 Rap 段落内的音符、歌词，并剔除 Rap 段落标记。"""
+    rap_ranges = [(section.start, section.end) for section in song.sections if is_rap_section(section)]
+    if not rap_ranges:
+        return song
+
+    def in_rap_range(start: int, end: int) -> bool:
+        return any(
+            _overlaps_time_range(start, end, range_start, range_end)
+            for range_start, range_end in rap_ranges
+        )
+
+    return SongData(
+        source_path=song.source_path,
+        mr_id=song.mr_id,
+        title=song.title,
+        title_origin=song.title_origin,
+        title_ko=song.title_ko,
+        title_en=song.title_en,
+        artist_origin=song.artist_origin,
+        artist_ko=song.artist_ko,
+        artist_en=song.artist_en,
+        notes=[note for note in song.notes if not in_rap_range(note.start, note.end)],
+        words_part_a=[
+            word for word in song.words_part_a if not in_rap_range(word.start, word.end)
+        ],
+        words_part_b=[
+            word for word in song.words_part_b if not in_rap_range(word.start, word.end)
+        ],
+        merged_words_part_a=[
+            word
+            for word in song.merged_words_part_a
+            if not in_rap_range(word.start, word.end)
+        ],
+        merged_words_part_b=[
+            word
+            for word in song.merged_words_part_b
+            if not in_rap_range(word.start, word.end)
+        ],
+        lines_part_a=[
+            line for line in song.lines_part_a if not in_rap_range(line.start, line.end)
+        ],
+        lines_part_b=[
+            line for line in song.lines_part_b if not in_rap_range(line.start, line.end)
+        ],
+        sections=[section for section in song.sections if not is_rap_section(section)],
+        tempo_bpm=song.tempo_bpm,
+    )
+
+
+def _shift_section_export_info(info: SectionExportInfo, offset_ms: int) -> SectionExportInfo:
+    section_start_ms, section_end_ms = _shift_time_range(
+        info.section_start_ms, info.section_end_ms, offset_ms
+    )
+    return SectionExportInfo(
+        name=info.name,
+        seq=info.seq,
+        section_start_ms=section_start_ms,
+        section_end_ms=section_end_ms,
+        first_line_text=info.first_line_text,
+        last_line_text=info.last_line_text,
+    )
+
+
+def apply_song_time_offset(song: SongData, offset_ms: int) -> SongData:
+    """对歌曲全部音符与歌词时间做整体偏移。"""
+    if offset_ms == 0:
+        return song
+
+    return SongData(
+        source_path=song.source_path,
+        mr_id=song.mr_id,
+        title=song.title,
+        title_origin=song.title_origin,
+        title_ko=song.title_ko,
+        title_en=song.title_en,
+        artist_origin=song.artist_origin,
+        artist_ko=song.artist_ko,
+        artist_en=song.artist_en,
+        notes=[_shift_note(note, offset_ms) for note in song.notes],
+        words_part_a=[_shift_lyric_word(word, offset_ms) for word in song.words_part_a],
+        words_part_b=[_shift_lyric_word(word, offset_ms) for word in song.words_part_b],
+        merged_words_part_a=[
+            _shift_merged_word(word, offset_ms) for word in song.merged_words_part_a
+        ],
+        merged_words_part_b=[
+            _shift_merged_word(word, offset_ms) for word in song.merged_words_part_b
+        ],
+        lines_part_a=[_shift_lyric_line(line, offset_ms) for line in song.lines_part_a],
+        lines_part_b=[_shift_lyric_line(line, offset_ms) for line in song.lines_part_b],
+        sections=[_shift_section(section, offset_ms) for section in song.sections],
+        section_export_infos=[
+            _shift_section_export_info(info, offset_ms)
+            for info in song.section_export_infos
+        ],
+        tempo_bpm=song.tempo_bpm,
+    )
 
 
 def is_valid_ms_json(data: dict[str, Any]) -> bool:
@@ -356,6 +676,8 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
         merged_words_part_b=_extract_merged_words(sections, "partB", lyric_field),
         lines_part_a=_extract_lines(sections, "partA", lyric_field),
         lines_part_b=_extract_lines(sections, "partB", lyric_field),
+        sections=_parse_sections(sections),
+        section_export_infos=extract_section_export_infos(sections, lyric_field),
         tempo_bpm=_parse_tempo(mnote.get("tempos", [])),
     )
 

@@ -5,7 +5,7 @@ block_cipher = None
 
 datas = [("icon.ico", ".")]
 binaries = []
-hiddenimports = ["mido.backends.backend_mido", "mido.backends.amidi"]
+hiddenimports = ["mido.backends.backend_mido", "mido.backends.amidi", "openpyxl"]
 
 for package in ("qfluentwidgets", "PyQt6"):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package)

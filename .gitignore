@@ -35,6 +35,11 @@ Desktop.ini
 SKILL.md
 test_output/
 
+# Test data
+MS JSON/
+36.json
+忽略标记/
+
 # Logs & temp
 *.log
 *.tmp

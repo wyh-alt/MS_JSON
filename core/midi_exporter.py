@@ -109,34 +109,161 @@ def _ranked_notes_for_word(word: LyricWord, notes: list[Note]) -> list[Note]:
     return [note for _, note in scored]
 
 
-def _match_word_to_notes(word: LyricWord, sorted_notes: list[Note]) -> list[Note] | None:
-    """一词优先对应一个音符；仅当词时长明显超出单音覆盖时才使用连续音符链。"""
-    ranked = _ranked_notes_for_word(word, sorted_notes)
+def _notes_for_part(notes: list[Note], part: str) -> list[Note]:
+    if part == "A":
+        return [note for note in notes if note.is_part_a]
+    if part == "B":
+        return [note for note in notes if note.is_part_b]
+    raise ValueError(f"未知声部: {part}")
+
+
+def _first_note_index_for_word(
+    word: LyricWord,
+    sorted_notes: list[Note],
+    note_index: dict[int, int],
+    *,
+    part: str | None = None,
+) -> int | None:
+    if part in ("A", "B"):
+        candidates = _notes_for_part(sorted_notes, part)
+    else:
+        candidates = sorted_notes
+    ranked = _ranked_notes_for_word(word, candidates)
     if not ranked:
         return None
+    return note_index[id(ranked[0])]
 
-    best = ranked[0]
-    word_duration = max(1, word.end - word.start)
-    coverage = _word_note_overlap(word, best) / word_duration
-    if word.end <= best.end + TIME_TOLERANCE_MS or coverage >= 0.6:
-        return [best]
 
-    note_index = {id(n): i for i, n in enumerate(sorted_notes)}
-    chain = [best]
-    for next_note in sorted_notes[note_index[id(best)] + 1 :]:
-        if next_note.start - chain[-1].end > TIME_TOLERANCE_MS:
-            break
-        chain.append(next_note)
-        chain_coverage = (
-            sum(_word_note_overlap(word, note) for note in chain) / word_duration
+def _collect_words_for_part(
+    song: SongData,
+    part: str,
+    lyric_granularity: LyricGranularity,
+) -> list[LyricWord]:
+    if lyric_granularity == "word":
+        words: list[LyricWord] = []
+        for group in _part_merged_words(song, part):
+            text = _normalize_lyric_text(group.text)
+            if text is None:
+                continue
+            words.append(LyricWord(group.start, group.end, text))
+        return words
+    return _prepare_syllable_words(_part_syllable_words(song, part))
+
+
+def _next_distinct_word_first_index(
+    first_indices: list[int | None],
+    word_index: int,
+    current_first_idx: int,
+) -> int | None:
+    """下一字首音索引；跳过与当前首音相同的多声部重复词条。"""
+    for later_index in range(word_index + 1, len(first_indices)):
+        candidate = first_indices[later_index]
+        if candidate is None or candidate == current_first_idx:
+            continue
+        return candidate
+    return None
+
+
+def _assign_tagged_words_to_note_indices(
+    sorted_notes: list[Note],
+    tagged_words: list[tuple[str, LyricWord]],
+) -> dict[int, str]:
+    """首音按声部匹配，延音符沿合并轨连续延伸，止于下一字首音。"""
+    if not tagged_words:
+        return {}
+
+    note_index = {id(note): index for index, note in enumerate(sorted_notes)}
+    words_sorted = sorted(
+        tagged_words,
+        key=lambda item: (item[1].start, item[1].end, item[1].text),
+    )
+    first_indices: list[int | None] = [
+        _first_note_index_for_word(
+            word,
+            sorted_notes,
+            note_index,
+            part=part if part in ("A", "B") else None,
         )
-        if (
-            chain[-1].end >= word.end - TIME_TOLERANCE_MS
-            and chain_coverage >= 0.6
-        ):
-            return chain
+        for part, word in words_sorted
+    ]
 
-    return [best]
+    lyric_map: dict[int, str] = {}
+    for word_index, (part, word) in enumerate(words_sorted):
+        first_idx = first_indices[word_index]
+        if first_idx is None:
+            continue
+
+        next_first_idx = _next_distinct_word_first_index(
+            first_indices, word_index, first_idx
+        )
+
+        chain = _extend_contiguous_note_indices(
+            sorted_notes,
+            first_idx,
+            next_first_idx,
+        )
+
+        if first_idx in lyric_map:
+            existing = lyric_map[first_idx]
+            if existing == EXTENSION_SYLLABLE:
+                lyric_map[first_idx] = word.text
+            elif _is_lyric_fragment(word.text):
+                lyric_map[first_idx] += word.text
+            elif existing.rstrip() == word.text.rstrip():
+                pass
+            else:
+                continue
+        else:
+            lyric_map[first_idx] = word.text
+
+        for idx in chain[1:]:
+            if idx in lyric_map and lyric_map[idx] != EXTENSION_SYLLABLE:
+                break
+            lyric_map[idx] = EXTENSION_SYLLABLE
+
+    return _refine_lyric_index_map(lyric_map)
+
+
+def _assign_words_to_note_indices(
+    sorted_notes: list[Note],
+    words: list[LyricWord],
+    *,
+    part: str | None = None,
+) -> dict[int, str]:
+    """以音符时间为准：首音写字，连续后续音写 -，至下一字首音前停止。"""
+    if not words:
+        return {}
+    tagged = [(part or "", word) for word in words]
+    return _assign_tagged_words_to_note_indices(sorted_notes, tagged)
+
+
+def _extend_contiguous_note_indices(
+    sorted_notes: list[Note],
+    first_idx: int,
+    next_first_idx: int | None,
+) -> list[int]:
+    """从首音起沿相对连续音符延伸，止于下一字首音或与前音间隔超过阈值。"""
+    boundary = len(sorted_notes) if next_first_idx is None else next_first_idx
+    chain = [first_idx]
+    for idx in range(first_idx + 1, boundary):
+        if sorted_notes[idx].start - sorted_notes[chain[-1]].end > TIME_TOLERANCE_MS:
+            break
+        chain.append(idx)
+    return chain
+
+
+def _match_word_to_notes(word: LyricWord, sorted_notes: list[Note]) -> list[Note] | None:
+    """匹配一词对应的连续音符链（供需要音符列表的调用方使用）。"""
+    note_index = {id(note): index for index, note in enumerate(sorted_notes)}
+    first_idx = _first_note_index_for_word(word, sorted_notes, note_index)
+    if first_idx is None:
+        return None
+    chain_indices = _extend_contiguous_note_indices(
+        sorted_notes,
+        first_idx,
+        len(sorted_notes),
+    )
+    return [sorted_notes[index] for index in chain_indices]
 
 
 def _strip_lyric_punctuation(text: str) -> str:
@@ -183,82 +310,28 @@ def _refine_lyric_index_map(index_map: dict[int, str]) -> dict[int, str]:
     return dict(merged)
 
 
-def map_lyrics_to_notes(notes: list[Note], words: list[LyricWord]) -> dict[int, str]:
+def map_lyrics_to_notes(
+    notes: list[Note], words: list[LyricWord], *, part: str | None = None
+) -> dict[int, str]:
     sorted_notes = sorted(notes, key=lambda n: (n.start, n.end, n.key))
-    note_index = {id(n): i for i, n in enumerate(sorted_notes)}
-    lyric_map: dict[int, str] = {}
-
-    for word in words:
-        matched = _match_word_to_notes(word, sorted_notes)
-        if not matched:
-            continue
-
-        first_idx = note_index[id(matched[0])]
-        if len(matched) == 1:
-            if first_idx not in lyric_map:
-                lyric_map[first_idx] = word.text
-            elif lyric_map[first_idx] == EXTENSION_SYLLABLE:
-                lyric_map[first_idx] = word.text
-            elif _is_lyric_fragment(word.text):
-                lyric_map[first_idx] += word.text
-            else:
-                continue
-            continue
-
-        if first_idx in lyric_map and lyric_map[first_idx] != EXTENSION_SYLLABLE:
-            continue
-        lyric_map[first_idx] = word.text
-        for note in matched[1:]:
-            lyric_map[note_index[id(note)]] = EXTENSION_SYLLABLE
-
-    return _refine_lyric_index_map(lyric_map)
+    return _assign_words_to_note_indices(sorted_notes, words, part=part)
 
 
 def map_merged_word_lyrics_to_notes(
-    notes: list[Note], word_groups: list[MergedLyricWord]
+    notes: list[Note],
+    word_groups: list[MergedLyricWord],
+    *,
+    part: str | None = None,
 ) -> dict[int, str]:
     """单词级：整词写在首音，同一词跨多音时后续音符写 -。"""
     sorted_notes = sorted(notes, key=lambda n: (n.start, n.end, n.key))
-    note_index = {id(n): i for i, n in enumerate(sorted_notes)}
-    lyric_map: dict[int, str] = {}
-
+    words: list[LyricWord] = []
     for group in word_groups:
-        note_indices: list[int] = []
-        seen: set[int] = set()
-
-        for syllable in group.syllables:
-            matched = _match_word_to_notes(syllable, sorted_notes)
-            if not matched:
-                continue
-            for note in matched:
-                idx = note_index[id(note)]
-                if idx in seen:
-                    continue
-                seen.add(idx)
-                note_indices.append(idx)
-
-        if not note_indices:
-            continue
-
-        note_indices.sort(key=lambda i: sorted_notes[i].start)
         text = _normalize_lyric_text(group.text)
         if text is None:
             continue
-
-        first_idx = note_indices[0]
-        if first_idx in lyric_map:
-            if lyric_map[first_idx] == EXTENSION_SYLLABLE:
-                lyric_map[first_idx] = text
-            else:
-                continue
-        else:
-            lyric_map[first_idx] = text
-
-        for idx in note_indices[1:]:
-            if idx not in lyric_map:
-                lyric_map[idx] = EXTENSION_SYLLABLE
-
-    return lyric_map
+        words.append(LyricWord(group.start, group.end, text))
+    return _assign_words_to_note_indices(sorted_notes, words, part=part)
 
 
 def _part_syllable_words(song: SongData, part: str) -> list[LyricWord]:
@@ -329,10 +402,10 @@ def _lyrics_by_signature_for_part(
     syllable_words = _prepare_syllable_words(_part_syllable_words(song, part))
     if lyric_granularity == "word":
         index_map = map_merged_word_lyrics_to_notes(
-            sorted_notes, _part_merged_words(song, part)
+            sorted_notes, _part_merged_words(song, part), part=part
         )
     else:
-        index_map = map_lyrics_to_notes(sorted_notes, syllable_words)
+        index_map = map_lyrics_to_notes(sorted_notes, syllable_words, part=part)
     return {_note_signature(sorted_notes[i]): text for i, text in index_map.items()}
 
 
@@ -358,14 +431,23 @@ def _merge_lyrics_by_signature(
     notes_a: list[Note],
     notes_b: list[Note],
     lyric_granularity: LyricGranularity,
+    *,
+    notes_other: list[Note] | None = None,
 ) -> dict[NoteSignature, str]:
-    merged: dict[NoteSignature, str] = {}
-    for part, notes in (("A", notes_a), ("B", notes_b)):
-        for signature, text in _lyrics_by_signature_for_part(
-            notes, song, part, lyric_granularity
-        ).items():
-            merged.setdefault(signature, text)
-    return merged
+    """合并轨：首音按 A/B 声部匹配，延音符沿全部音符延伸。"""
+    notes_other = notes_other or []
+    combined = sorted(
+        _dedupe_notes(notes_a + notes_b + notes_other),
+        key=lambda n: (n.start, n.end, n.key),
+    )
+    tagged: list[tuple[str, LyricWord]] = []
+    for part in ("A", "B"):
+        tagged.extend(
+            (part, word)
+            for word in _collect_words_for_part(song, part, lyric_granularity)
+        )
+    index_map = _assign_tagged_words_to_note_indices(combined, tagged)
+    return {_note_signature(combined[i]): text for i, text in index_map.items()}
 
 
 def _dedupe_notes(notes: list[Note]) -> list[Note]:
@@ -702,7 +784,9 @@ def _export_merge_same_track(
     combined = _dedupe_notes(notes_a + notes_b + notes_other)
     lyric_map = (
         _format_ktv_lyric_map(
-            _merge_lyrics_by_signature(song, notes_a, notes_b, lyric_granularity)
+            _merge_lyrics_by_signature(
+                song, notes_a, notes_b, lyric_granularity, notes_other=notes_other
+            )
         )
         if write_lyrics
         else {}
@@ -790,7 +874,7 @@ def export_song(
     *,
     write_tempo: bool = True,
     write_lyrics: bool = True,
-    lyric_granularity: LyricGranularity = "syllable",
+    lyric_granularity: LyricGranularity = "word",
     lower_octave: bool = True,
     write_section_markers: bool = False,
     exclude_rap_sections: bool = False,

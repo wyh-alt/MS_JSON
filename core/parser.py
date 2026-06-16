@@ -226,6 +226,7 @@ def _extract_merged_words(
             buffer_syllables: list[LyricWord] = []
             buffer_start: int | None = None
             buffer_end: int | None = None
+            line_words = line.get("word", [])
 
             def flush() -> None:
                 nonlocal buffer_texts, buffer_syllables, buffer_start, buffer_end
@@ -244,9 +245,27 @@ def _extract_merged_words(
                 buffer_start = None
                 buffer_end = None
 
-            for word in line.get("word", []):
-                text = normalize_lyric_text(str(word.get(lyric_field, "")))
+            def has_following_lyric(start_index: int) -> bool:
+                for later in line_words[start_index + 1 :]:
+                    later_text = normalize_lyric_text(str(later.get(lyric_field, "")))
+                    if later_text is not None:
+                        return True
+                return False
+
+            for index, word in enumerate(line_words):
+                raw_text = str(word.get(lyric_field, ""))
+                text = normalize_lyric_text(raw_text)
                 if text is None:
+                    # 纯符号词条（如 ~）在句中视作空格分词；句尾不补空格。
+                    if (
+                        buffer_texts
+                        and raw_text.strip()
+                        and strip_lyric_punctuation(raw_text) == ""
+                        and has_following_lyric(index)
+                    ):
+                        if not buffer_texts[-1].endswith(" "):
+                            buffer_texts[-1] += " "
+                        flush()
                     continue
                 if _contains_cjk(text):
                     flush()
@@ -544,7 +563,44 @@ def _overlaps_time_range(start: int, end: int, range_start: int, range_end: int)
 
 
 NON_MELODY_FAR_SEMITONES = 12
-NON_MELODY_REGION_GAP_MS = 150
+_VOCAL_OCTAVE_OFFSET = 12
+HUMAN_VOCAL_PITCH_MIN = 48
+HUMAN_VOCAL_PITCH_MAX = 84
+_MIN_SINGING_RANGE_SAMPLES = 8
+
+
+def _effective_vocal_pitch(note: Note) -> int:
+    """与 MIDI 导出降八度后的音高一致，用于判断是否在演唱音域内。"""
+    return max(0, min(127, note.key - _VOCAL_OCTAVE_OFFSET))
+
+
+def _singing_pitch_range(notes: list[Note]) -> tuple[int, int]:
+    """从音符中提取核心演唱音域（参考正常人声范围）。"""
+    pitches = [_effective_vocal_pitch(note) for note in notes]
+    in_vocal = [
+        pitch
+        for pitch in pitches
+        if HUMAN_VOCAL_PITCH_MIN <= pitch <= HUMAN_VOCAL_PITCH_MAX
+    ]
+    pool = in_vocal if len(in_vocal) >= _MIN_SINGING_RANGE_SAMPLES else pitches
+    if not pool:
+        return HUMAN_VOCAL_PITCH_MIN, HUMAN_VOCAL_PITCH_MAX
+    sorted_pitches = sorted(pool)
+    q25 = sorted_pitches[len(sorted_pitches) // 4]
+    q75 = sorted_pitches[(len(sorted_pitches) * 3) // 4]
+    return q25, q75
+
+
+def _singing_range_bounds(sing_q25: int, sing_q75: int) -> tuple[int, int]:
+    low = max(HUMAN_VOCAL_PITCH_MIN, sing_q25 - NON_MELODY_FAR_SEMITONES)
+    high = min(HUMAN_VOCAL_PITCH_MAX, sing_q75 + NON_MELODY_FAR_SEMITONES)
+    if high <= low:
+        high = low + 1
+    return low, high
+
+
+def _is_outside_singing_range(pitch: int, low: int, high: int) -> bool:
+    return pitch < low or pitch > high
 
 
 def _note_signature(note: Note) -> tuple[int, int, int]:
@@ -559,20 +615,26 @@ def _notes_overlapping_section(section: SongSection, notes: list[Note]) -> list[
     ]
 
 
-def _pitch_core_range(keys: list[int]) -> tuple[int, int]:
-    if not keys:
-        return 60, 72
-    sorted_keys = sorted(keys)
-    q25 = sorted_keys[len(sorted_keys) // 4]
-    q75 = sorted_keys[(len(sorted_keys) * 3) // 4]
-    return q25, q75
+def _outside_singing_range_note_signatures(
+    song: SongData,
+    *,
+    excluded: set[tuple[int, int, int]],
+    protected: set[tuple[int, int, int]],
+) -> set[tuple[int, int, int]]:
+    """远高于或远低于歌曲演唱音域的同音高占位音符（含孤立单音）。"""
+    if not song.notes:
+        return set()
 
-
-def _is_pitch_far_from_core_range(pitch: int, q25: int, q75: int) -> bool:
-    return (
-        pitch < q25 - NON_MELODY_FAR_SEMITONES
-        or pitch > q75 + NON_MELODY_FAR_SEMITONES
-    )
+    sing_q25, sing_q75 = _singing_pitch_range(song.notes)
+    low_bound, high_bound = _singing_range_bounds(sing_q25, sing_q75)
+    marked: set[tuple[int, int, int]] = set()
+    for note in song.notes:
+        signature = _note_signature(note)
+        if signature in excluded or signature in protected:
+            continue
+        if _is_outside_singing_range(_effective_vocal_pitch(note), low_bound, high_bound):
+            marked.add(signature)
+    return marked
 
 
 def _first_content_section_marker_start(song: SongData) -> int | None:
@@ -585,16 +647,26 @@ def _first_content_section_marker_start(song: SongData) -> int | None:
     return sorted(song.sections, key=lambda item: (item.start, item.seq))[0].start
 
 
-def _protected_pre_marker_note_signatures(song: SongData) -> set[tuple[int, int, int]]:
-    """早于首个内容段落标记的音符不参与非旋律删除（常见为段前 10ms 先行音）。"""
-    marker_start = _first_content_section_marker_start(song)
-    if marker_start is None:
+def _protected_pre_marker_note_signatures(song: SongData, *, pickup_ms: int = 50) -> set[tuple[int, int, int]]:
+    """段前先行音：首个演唱段落标记之前的音符，以及各演唱段落标记前 pickup_ms 内的音符。"""
+    markers = sorted(
+        {section.start for section in song.sections if section.part_a or section.part_b}
+    )
+    if not markers:
         return set()
-    return {
-        _note_signature(note)
-        for note in song.notes
-        if note.start < marker_start
-    }
+
+    first_marker = markers[0]
+    protected: set[tuple[int, int, int]] = set()
+    for note in song.notes:
+        signature = _note_signature(note)
+        if note.start < first_marker:
+            protected.add(signature)
+            continue
+        for marker in markers:
+            if marker - pickup_ms <= note.start < marker:
+                protected.add(signature)
+                break
+    return protected
 
 
 def _same_pitch_section_note_signatures(
@@ -602,9 +674,11 @@ def _same_pitch_section_note_signatures(
     *,
     protected: set[tuple[int, int, int]],
 ) -> set[tuple[int, int, int]]:
-    """段落内全部音符为同一音高。"""
+    """演唱段落内全部音符为同一音高（intro/interlude 等无演唱声部段落不适用）。"""
     marked: set[tuple[int, int, int]] = set()
     for section in song.sections:
+        if not section.part_a and not section.part_b:
+            continue
         section_notes = [
             note
             for note in _notes_overlapping_section(section, song.notes)
@@ -614,47 +688,6 @@ def _same_pitch_section_note_signatures(
             continue
         if len({note.key for note in section_notes}) == 1:
             marked.update(_note_signature(note) for note in section_notes)
-    return marked
-
-
-def _far_flat_region_note_signatures(
-    song: SongData,
-    *,
-    excluded: set[tuple[int, int, int]],
-    protected: set[tuple[int, int, int]],
-) -> set[tuple[int, int, int]]:
-    """连续同音高且偏离整体音域的音符区域（至少 2 个连续音符）。"""
-    notes = sorted(song.notes, key=lambda note: (note.start, note.end, note.key))
-    if not notes:
-        return set()
-
-    q25, q75 = _pitch_core_range([note.key for note in notes])
-    marked: set[tuple[int, int, int]] = set()
-    index = 0
-    while index < len(notes):
-        note = notes[index]
-        signature = _note_signature(note)
-        if signature in excluded or signature in protected:
-            index += 1
-            continue
-
-        run_end = index + 1
-        while run_end < len(notes):
-            previous = notes[run_end - 1]
-            current = notes[run_end]
-            if current.key != note.key:
-                break
-            if current.start - previous.end > NON_MELODY_REGION_GAP_MS:
-                break
-            run_end += 1
-
-        run = notes[index:run_end]
-        if (
-            len(run) >= 2
-            and _is_pitch_far_from_core_range(note.key, q25, q75)
-        ):
-            marked.update(_note_signature(item) for item in run)
-        index = run_end if run_end > index + 1 else index + 1
     return marked
 
 
@@ -674,12 +707,12 @@ def _merge_time_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
 def _collect_non_melody_note_signatures(song: SongData) -> set[tuple[int, int, int]]:
     protected = _protected_pre_marker_note_signatures(song)
     section_flat = _same_pitch_section_note_signatures(song, protected=protected)
-    region_flat = _far_flat_region_note_signatures(
+    outside_singing = _outside_singing_range_note_signatures(
         song,
         excluded=section_flat,
         protected=protected,
     )
-    return (section_flat | region_flat) - protected
+    return (section_flat | outside_singing) - protected
 
 
 def _filter_song_by_removed_note_ranges(

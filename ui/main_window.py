@@ -190,7 +190,6 @@ class ExportPage(ScrollArea):
         )
         for label, _ in LYRIC_GRANULARITY_LABELS:
             self.lyric_granularity_combo.addItem(label)
-        self.lyric_granularity_combo.setCurrentIndex(1)
         lyric_row.addWidget(self.lyric_granularity_combo)
         lyric_row.addStretch(1)
         option_layout.addWidget(self.lyric_options_widget)

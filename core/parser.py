@@ -17,7 +17,7 @@ def strip_lyric_punctuation(text: str) -> str:
     """去除歌词无意义标点（如 ~ ！），保留撇号用于缩写。"""
     chars: list[str] = []
     for ch in text:
-        if ch in _APOSTROPHES:
+        if ch in _APOSTROPHES or ch == "#":
             chars.append(ch)
         elif ch in _EXPLICIT_LYRIC_PUNCT or unicodedata.category(ch).startswith("P"):
             continue
@@ -111,6 +111,9 @@ class SongData:
     sections: list[SongSection] = field(default_factory=list)
     section_export_infos: list[SectionExportInfo] = field(default_factory=list)
     tempo_bpm: float = 120.0
+    original_key: str = ""
+    file_mr_mel_m: str = ""
+    file_mr_mel_w: str = ""
 
 
 def _field_value(data: dict[str, Any], prefix: str, lang: str) -> str:
@@ -764,6 +767,9 @@ def _filter_song_by_removed_note_ranges(
         sections=list(song.sections),
         section_export_infos=list(song.section_export_infos),
         tempo_bpm=song.tempo_bpm,
+        original_key=song.original_key,
+        file_mr_mel_m=song.file_mr_mel_m,
+        file_mr_mel_w=song.file_mr_mel_w,
     )
 
 
@@ -825,7 +831,11 @@ def exclude_rap_sections_from_song(song: SongData) -> SongData:
             line for line in song.lines_part_b if not in_rap_range(line.start, line.end)
         ],
         sections=[section for section in song.sections if not is_rap_section(section)],
+        section_export_infos=list(song.section_export_infos),
         tempo_bpm=song.tempo_bpm,
+        original_key=song.original_key,
+        file_mr_mel_m=song.file_mr_mel_m,
+        file_mr_mel_w=song.file_mr_mel_w,
     )
 
 
@@ -875,6 +885,9 @@ def apply_song_time_offset(song: SongData, offset_ms: int) -> SongData:
             for info in song.section_export_infos
         ],
         tempo_bpm=song.tempo_bpm,
+        original_key=song.original_key,
+        file_mr_mel_m=song.file_mr_mel_m,
+        file_mr_mel_w=song.file_mr_mel_w,
     )
 
 
@@ -915,6 +928,9 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
         sections=_parse_sections(sections),
         section_export_infos=extract_section_export_infos(sections, lyric_field),
         tempo_bpm=_parse_tempo(mnote.get("tempos", [])),
+        original_key=str(data.get("original_key", "") or "").strip(),
+        file_mr_mel_m=str(data.get("file_mr_mel_m", "") or "").strip(),
+        file_mr_mel_w=str(data.get("file_mr_mel_w", "") or "").strip(),
     )
 
 

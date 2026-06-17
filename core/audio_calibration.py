@@ -5,6 +5,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 import wave
@@ -259,7 +260,7 @@ def _ensure_pcm_wav(audio_path: Path) -> Path:
         if wav_cache.stat().st_mtime >= audio_path.stat().st_mtime:
             return wav_cache
 
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _find_ffmpeg_executable()
     if ffmpeg is None:
         return audio_path
 
@@ -293,6 +294,21 @@ def _ensure_pcm_wav(audio_path: Path) -> Path:
         raise RuntimeError(f"ffmpeg 解码失败: {stderr or exc}") from exc
 
     return wav_cache
+
+
+def _find_ffmpeg_executable() -> str | None:
+    """优先使用打包内置 ffmpeg，其次使用系统 PATH。"""
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "ffmpeg.exe")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "ffmpeg.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("ffmpeg")
 
 
 def _resolve_audio_file(url_or_path: str, json_path: str) -> Path:

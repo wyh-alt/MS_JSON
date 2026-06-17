@@ -6,6 +6,12 @@ echo Installing build dependencies...
 python -m pip install -r requirements.txt pyinstaller -q
 if errorlevel 1 exit /b 1
 
+where ffmpeg >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] ffmpeg not found in PATH. Please install ffmpeg before packaging.
+    exit /b 1
+)
+
 echo Building MS_json.exe ...
 python -m PyInstaller MS_json.spec --noconfirm --clean
 if errorlevel 1 exit /b 1

@@ -1418,7 +1418,7 @@ def _prepare_song_for_export(
     time_offset_ms: int,
     audio_reference_calibration: bool,
 ) -> tuple[SongData, "AudioCalibrationResult | None", str | None]:
-    from core.audio_calibration import AudioCalibrationResult, compute_audio_calibration_offset
+    from core.audio_calibration import resolve_export_time_offset
 
     if part_mode == "lyric_lang_split" and song.source_path:
         song = load_song_json(song.source_path, "ori")
@@ -1427,16 +1427,11 @@ def _prepare_song_for_export(
     if remove_non_melody_notes:
         song = exclude_non_melody_notes_from_song(song)
 
-    calibration: AudioCalibrationResult | None = None
-    calibration_error: str | None = None
-    total_offset_ms = time_offset_ms
-    if audio_reference_calibration:
-        try:
-            calibration = compute_audio_calibration_offset(song)
-            total_offset_ms += calibration.offset_ms
-        except Exception as exc:
-            calibration_error = str(exc)
-
+    total_offset_ms, calibration, calibration_error = resolve_export_time_offset(
+        song,
+        time_offset_ms=time_offset_ms,
+        audio_reference_calibration=audio_reference_calibration,
+    )
     song = apply_song_time_offset(song, total_offset_ms)
     return song, calibration, calibration_error
 
@@ -1466,17 +1461,14 @@ def export_song(
         audio_reference_calibration=audio_reference_calibration,
     )
     if calibration_log is not None and audio_reference_calibration:
-        if calibration is not None:
-            calibration_log.append(
-                f"音频校准 {calibration.offset_ms:+d} ms "
-                f"(匹配 MIDI {calibration.matched_midi_ms} ms ↔ "
-                f"音频 {calibration.matched_audio_ms} ms, "
-                f"命中 {calibration.match_count} 个音符)"
-            )
-        else:
-            calibration_log.append(
-                f"音频校准跳过（{calibration_error or '未知原因'}）"
-            )
+        from core.audio_calibration import append_calibration_log
+
+        append_calibration_log(
+            calibration_log,
+            audio_reference_calibration=audio_reference_calibration,
+            calibration=calibration,
+            calibration_error=calibration_error,
+        )
     if part_mode == "separate":
         if not song.notes:
             raise ValueError("没有可导出的音符")

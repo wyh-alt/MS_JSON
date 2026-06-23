@@ -39,6 +39,52 @@ class AudioCalibrationResult:
     audio_source: str
     decode_source: str
 
+
+def resolve_export_time_offset(
+    song: SongData,
+    *,
+    time_offset_ms: int = 0,
+    audio_reference_calibration: bool = True,
+) -> tuple[int, AudioCalibrationResult | None, str | None]:
+    """计算导出用的总时间偏移（手动偏移 + 音频参考校准）。"""
+    calibration: AudioCalibrationResult | None = None
+    calibration_error: str | None = None
+    total_offset_ms = time_offset_ms
+    if audio_reference_calibration:
+        try:
+            calibration = compute_audio_calibration_offset(song)
+            total_offset_ms += calibration.offset_ms
+        except Exception as exc:
+            calibration_error = str(exc)
+    return total_offset_ms, calibration, calibration_error
+
+
+def format_calibration_log_message(calibration: AudioCalibrationResult) -> str:
+    return (
+        f"音频校准 {calibration.offset_ms:+d} ms "
+        f"(匹配 MIDI {calibration.matched_midi_ms} ms ↔ "
+        f"音频 {calibration.matched_audio_ms} ms, "
+        f"命中 {calibration.match_count} 个音符)"
+    )
+
+
+def append_calibration_log(
+    calibration_log: list[str] | None,
+    *,
+    audio_reference_calibration: bool,
+    calibration: AudioCalibrationResult | None,
+    calibration_error: str | None,
+) -> None:
+    if calibration_log is None or not audio_reference_calibration:
+        return
+    if calibration is not None:
+        calibration_log.append(format_calibration_log_message(calibration))
+    else:
+        calibration_log.append(
+            f"音频校准跳过（{calibration_error or '未知原因'}）"
+        )
+
+
 def first_note_start_ms(song: SongData) -> int | None:
     if not song.notes:
         return None

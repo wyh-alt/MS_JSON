@@ -15,6 +15,7 @@ from core.parser import (
     load_song_json,
     resolve_artist,
     resolve_title,
+    shift_time_ms,
 )
 
 LyricFormat = Literal["ksc-txt", "ksc", "txt", "lrc", "csv"]
@@ -280,6 +281,22 @@ def _output_basename(song: SongData, lyric_format: LyricFormat, title_lang: str)
     return f"{title}_{song.mr_id}-歌词"
 
 
+def _prepare_lyric_song(
+    song: SongData,
+    *,
+    time_offset_ms: int = 0,
+    audio_reference_calibration: bool = True,
+) -> tuple[SongData, "AudioCalibrationResult | None", str | None]:
+    from core.audio_calibration import AudioCalibrationResult, resolve_export_time_offset
+
+    total_offset_ms, calibration, calibration_error = resolve_export_time_offset(
+        song,
+        time_offset_ms=time_offset_ms,
+        audio_reference_calibration=audio_reference_calibration,
+    )
+    return apply_song_time_offset(song, total_offset_ms), calibration, calibration_error
+
+
 def export_song_lyrics(
     song: SongData,
     output_dir: str,
@@ -290,8 +307,23 @@ def export_song_lyrics(
     artist_lang: str,
     ksc_options: KscOptions | None = None,
     time_offset_ms: int = 0,
+    audio_reference_calibration: bool = True,
+    calibration_log: list[str] | None = None,
 ) -> str:
-    song = apply_song_time_offset(song, time_offset_ms)
+    song, calibration, calibration_error = _prepare_lyric_song(
+        song,
+        time_offset_ms=time_offset_ms,
+        audio_reference_calibration=audio_reference_calibration,
+    )
+    if calibration_log is not None:
+        from core.audio_calibration import append_calibration_log
+
+        append_calibration_log(
+            calibration_log,
+            audio_reference_calibration=audio_reference_calibration,
+            calibration=calibration,
+            calibration_error=calibration_error,
+        )
     content = render_lyrics(
         song,
         lyric_format=lyric_format,
@@ -323,25 +355,53 @@ def _format_section_time(ms: int) -> str:
     return _format_ksc_time(ms)
 
 
+def _section_export_times(
+    section_start_ms: int,
+    section_end_ms: int,
+    offset_ms: int,
+) -> tuple[int, int]:
+    """段落表格时间：原起始为 0 的段落（如 intro）保持从 0 开始，其余按偏移校准。"""
+    if section_start_ms == 0:
+        start_ms = 0
+    else:
+        start_ms = shift_time_ms(section_start_ms, offset_ms)
+    end_ms = shift_time_ms(section_end_ms, offset_ms)
+    if end_ms <= start_ms:
+        end_ms = start_ms + 1
+    return start_ms, end_ms
+
+
 def collect_section_export_rows(
     song: SongData,
     *,
     title_lang: str,
     artist_lang: str,
     time_offset_ms: int = 0,
+    audio_reference_calibration: bool = True,
 ) -> list[tuple[str, str, str, str, str, str, str]]:
-    song = apply_song_time_offset(song, time_offset_ms)
+    from core.audio_calibration import resolve_export_time_offset
+
+    total_offset_ms, _, _ = resolve_export_time_offset(
+        song,
+        time_offset_ms=time_offset_ms,
+        audio_reference_calibration=audio_reference_calibration,
+    )
     title = resolve_title(song, title_lang)
     artist = resolve_artist(song, artist_lang) or ""
     rows: list[tuple[str, str, str, str, str, str, str]] = []
     for info in song.section_export_infos:
+        start_ms, end_ms = _section_export_times(
+            info.section_start_ms,
+            info.section_end_ms,
+            total_offset_ms,
+        )
         rows.append(
             (
                 title,
                 artist,
                 format_section_display_name(info.name),
-                _format_section_time(info.section_start_ms),
-                _format_section_time(info.section_end_ms),
+                _format_section_time(start_ms),
+                _format_section_time(end_ms),
                 info.first_line_text,
                 info.last_line_text,
             )

@@ -41,6 +41,7 @@ LYRIC_FIELD_OPTIONS = [
 class LyricExportResult:
     success: list[str]
     failed: list[tuple[str, str]]
+    calibration_notes: list[str]
 
 
 @dataclass
@@ -62,6 +63,7 @@ class SectionExportWorker(QThread):
         title_lang: str,
         artist_lang: str,
         time_offset_ms: int,
+        audio_reference_calibration: bool,
         parent=None,
     ):
         super().__init__(parent)
@@ -71,6 +73,7 @@ class SectionExportWorker(QThread):
         self.title_lang = title_lang
         self.artist_lang = artist_lang
         self.time_offset_ms = time_offset_ms
+        self.audio_reference_calibration = audio_reference_calibration
 
     def run(self):
         try:
@@ -86,6 +89,7 @@ class SectionExportWorker(QThread):
                         title_lang=self.title_lang,
                         artist_lang=self.artist_lang,
                         time_offset_ms=self.time_offset_ms,
+                        audio_reference_calibration=self.audio_reference_calibration,
                     )
                 )
             output_path = write_sections_excel(all_rows, self.output_dir)
@@ -109,6 +113,7 @@ class LyricExportWorker(QThread):
         artist_lang: str,
         ksc_options: KscOptions,
         time_offset_ms: int,
+        audio_reference_calibration: bool,
         parent=None,
     ):
         super().__init__(parent)
@@ -121,9 +126,10 @@ class LyricExportWorker(QThread):
         self.artist_lang = artist_lang
         self.ksc_options = ksc_options
         self.time_offset_ms = time_offset_ms
+        self.audio_reference_calibration = audio_reference_calibration
 
     def run(self):
-        result = LyricExportResult(success=[], failed=[])
+        result = LyricExportResult(success=[], failed=[], calibration_notes=[])
         total = len(self.json_paths)
 
         for index, path in enumerate(self.json_paths, start=1):
@@ -131,6 +137,7 @@ class LyricExportWorker(QThread):
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
             try:
                 song = load_song_json(path, self.lyric_field)
+                calibration_log: list[str] = []
                 output_path = export_song_lyrics(
                     song,
                     self.output_dir,
@@ -140,7 +147,11 @@ class LyricExportWorker(QThread):
                     artist_lang=self.artist_lang,
                     ksc_options=self.ksc_options,
                     time_offset_ms=self.time_offset_ms,
+                    audio_reference_calibration=self.audio_reference_calibration,
+                    calibration_log=calibration_log,
                 )
+                if calibration_log:
+                    result.calibration_notes.append(f"{name}: {calibration_log[0]}")
                 result.success.append(output_path)
             except Exception as exc:
                 result.failed.append((path, str(exc)))
@@ -236,6 +247,14 @@ class LyricExportPage(ScrollArea):
         self.offset_spinbox = create_offset_spinbox(option_card)
         offset_row.addWidget(self.offset_spinbox)
         offset_row.addWidget(BodyLabel("正数向后，负数向前"))
+        self.audio_calibration_checkbox = CheckBox("音频参考校准", option_card)
+        self.audio_calibration_checkbox.setChecked(True)
+        self.audio_calibration_checkbox.setToolTip(
+            "根据 original_key 对应的 file_mr_mel 旋律音频，"
+            "用能量包络检测首个可感知旋律音并与 MIDI 匹配；"
+            "为全部歌词时间戳做整体偏移校准。"
+        )
+        offset_row.addWidget(self.audio_calibration_checkbox)
         offset_row.addStretch(1)
         option_layout.addLayout(offset_row)
         layout.addWidget(option_card)
@@ -349,6 +368,7 @@ class LyricExportPage(ScrollArea):
         title_lang = META_LANG_LABELS[self.title_lang_combo.currentIndex()][1]
         artist_lang = META_LANG_LABELS[self.artist_lang_combo.currentIndex()][1]
         time_offset_ms = self.offset_spinbox.value()
+        audio_reference_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_export_buttons_enabled(False)
         InfoBar.info(
@@ -366,6 +386,7 @@ class LyricExportPage(ScrollArea):
             title_lang=title_lang,
             artist_lang=artist_lang,
             time_offset_ms=time_offset_ms,
+            audio_reference_calibration=audio_reference_calibration,
         )
         self.section_worker.progress.connect(self._on_section_progress)
         self.section_worker.finished.connect(self._on_section_finished)
@@ -411,6 +432,7 @@ class LyricExportPage(ScrollArea):
             word_bracket=self.word_bracket_checkbox.isChecked(),
         )
         time_offset_ms = self.offset_spinbox.value()
+        audio_reference_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_export_buttons_enabled(False)
         InfoBar.info(
@@ -431,6 +453,7 @@ class LyricExportPage(ScrollArea):
             artist_lang=artist_lang,
             ksc_options=ksc_options,
             time_offset_ms=time_offset_ms,
+            audio_reference_calibration=audio_reference_calibration,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
@@ -443,16 +466,24 @@ class LyricExportPage(ScrollArea):
         self._set_export_buttons_enabled(True)
 
         if result.success and not result.failed:
+            detail = f"成功导出 {len(result.success)} 个歌词文件。"
+            if result.calibration_notes:
+                detail += "\n" + "\n".join(result.calibration_notes[:5])
+                if len(result.calibration_notes) > 5:
+                    detail += f"\n... 另有 {len(result.calibration_notes) - 5} 条校准记录"
             InfoBar.success(
                 "导出完成",
-                f"成功导出 {len(result.success)} 个歌词文件。",
-                duration=4000,
+                detail,
+                duration=6000,
                 parent=self.window(),
                 position=InfoBarPosition.TOP,
             )
             return
 
         lines = [f"成功: {len(result.success)} 个歌词文件"]
+        if result.calibration_notes:
+            lines.append("音频校准:")
+            lines.extend(f"- {note}" for note in result.calibration_notes[:8])
         if result.failed:
             lines.append(f"失败: {len(result.failed)} 个 JSON 文件")
             for path, reason in result.failed[:8]:

@@ -1,13 +1,8 @@
 """根据 MR 旋律参考音频与 MIDI 音符对齐校准时间轴。"""
 from __future__ import annotations
 
-import hashlib
 import os
-import shutil
 import subprocess
-import sys
-import urllib.error
-import urllib.request
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +10,11 @@ from pathlib import Path
 import numpy as np
 
 from core.parser import SongData
+from core.audio_downloader import (
+    find_ffmpeg_executable,
+    resolve_audio_file,
+    resolve_mr_mel_url,
+)
 
 CALIBRATION_ANALYZE_MS = 30_000
 HOP_LENGTH = 512
@@ -39,17 +39,6 @@ class AudioCalibrationResult:
     audio_source: str
     decode_source: str
 
-
-def resolve_mr_mel_url(song: SongData) -> str | None:
-    """按 original_key 选择 file_mr_mel_m / file_mr_mel_w。"""
-    key = (song.original_key or "").strip().lower()
-    if key == "m":
-        return song.file_mr_mel_m or None
-    if key == "w":
-        return song.file_mr_mel_w or None
-    return None
-
-
 def first_note_start_ms(song: SongData) -> int | None:
     if not song.notes:
         return None
@@ -67,7 +56,7 @@ def compute_audio_calibration_offset(song: SongData) -> AudioCalibrationResult:
     if midi_first_ms is None:
         raise ValueError("歌曲没有可导出的 MIDI 音符")
 
-    audio_path = _resolve_audio_file(mel_url, song.source_path)
+    audio_path = resolve_audio_file(mel_url, song.source_path)
     decode_path = _ensure_pcm_wav(audio_path)
     envelope = _analyze_attack_envelope(str(decode_path))
     audio_first_ms = envelope.perceived_note_ms
@@ -260,7 +249,7 @@ def _ensure_pcm_wav(audio_path: Path) -> Path:
         if wav_cache.stat().st_mtime >= audio_path.stat().st_mtime:
             return wav_cache
 
-    ffmpeg = _find_ffmpeg_executable()
+    ffmpeg = find_ffmpeg_executable()
     if ffmpeg is None:
         return audio_path
 
@@ -294,69 +283,3 @@ def _ensure_pcm_wav(audio_path: Path) -> Path:
         raise RuntimeError(f"ffmpeg 解码失败: {stderr or exc}") from exc
 
     return wav_cache
-
-
-def _find_ffmpeg_executable() -> str | None:
-    """优先使用打包内置 ffmpeg，其次使用系统 PATH。"""
-    candidates: list[Path] = []
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        candidates.append(exe_dir / "ffmpeg.exe")
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            candidates.append(Path(meipass) / "ffmpeg.exe")
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return shutil.which("ffmpeg")
-
-
-def _resolve_audio_file(url_or_path: str, json_path: str) -> Path:
-    value = (url_or_path or "").strip()
-    if not value:
-        raise FileNotFoundError("MR 旋律音频路径为空")
-
-    if value.startswith(("http://", "https://")):
-        return _download_cached_audio(value, json_path)
-
-    path = Path(value)
-    if path.is_file():
-        return path
-
-    json_dir = Path(json_path).parent
-    by_name = json_dir / path.name
-    if by_name.is_file():
-        return by_name
-
-    raise FileNotFoundError(f"找不到 MR 旋律音频: {value}")
-
-
-def _download_cached_audio(url: str, json_path: str) -> Path:
-    suffix = Path(url.split("?", 1)[0]).suffix or ".m4a"
-    cache_dir = Path(json_path).parent / ".ms_json_audio_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] + suffix
-    cache_path = cache_dir / cache_name
-
-    if cache_path.is_file() and cache_path.stat().st_size > 0:
-        return cache_path
-
-    temp_path = cache_path.with_suffix(cache_path.suffix + ".part")
-    try:
-        request = urllib.request.Request(url, headers={"User-Agent": "MS_json/1.0"})
-        with urllib.request.urlopen(request, timeout=120) as response:
-            data = response.read()
-        if not data:
-            raise ValueError("下载的音频文件为空")
-        temp_path.write_bytes(data)
-        os.replace(temp_path, cache_path)
-    except urllib.error.URLError as exc:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise FileNotFoundError(f"下载 MR 旋律音频失败: {url} ({exc})") from exc
-    except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
-
-    return cache_path

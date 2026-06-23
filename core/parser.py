@@ -101,6 +101,9 @@ class SongData:
     artist_origin: str = ""
     artist_ko: str = ""
     artist_en: str = ""
+    album_origin: str = ""
+    album_ko: str = ""
+    album_en: str = ""
     notes: list[Note] = field(default_factory=list)
     words_part_a: list[LyricWord] = field(default_factory=list)
     words_part_b: list[LyricWord] = field(default_factory=list)
@@ -114,6 +117,11 @@ class SongData:
     original_key: str = ""
     file_mr_mel_m: str = ""
     file_mr_mel_w: str = ""
+    file_mr_har_m: str = ""
+    file_mr_har_w: str = ""
+    file_mr_drum_m: str = ""
+    file_mr_drum_w: str = ""
+    file_mr_drum: str = ""
 
 
 def _field_value(data: dict[str, Any], prefix: str, lang: str) -> str:
@@ -137,6 +145,16 @@ def resolve_artist(song: SongData, lang: str) -> str:
     if lang == "en":
         return song.artist_en
     return song.artist_origin
+
+
+def resolve_album(song: SongData, lang: str) -> str:
+    if lang == "origin":
+        return song.album_origin
+    if lang == "ko":
+        return song.album_ko
+    if lang == "en":
+        return song.album_en
+    return song.album_origin
 
 
 def _safe_title(data: dict[str, Any]) -> str:
@@ -741,6 +759,9 @@ def _filter_song_by_removed_note_ranges(
         artist_origin=song.artist_origin,
         artist_ko=song.artist_ko,
         artist_en=song.artist_en,
+        album_origin=song.album_origin,
+        album_ko=song.album_ko,
+        album_en=song.album_en,
         notes=[note for note in song.notes if not overlaps_removed(note.start, note.end)],
         words_part_a=[
             word for word in song.words_part_a if not overlaps_removed(word.start, word.end)
@@ -770,6 +791,11 @@ def _filter_song_by_removed_note_ranges(
         original_key=song.original_key,
         file_mr_mel_m=song.file_mr_mel_m,
         file_mr_mel_w=song.file_mr_mel_w,
+        file_mr_har_m=song.file_mr_har_m,
+        file_mr_har_w=song.file_mr_har_w,
+        file_mr_drum_m=song.file_mr_drum_m,
+        file_mr_drum_w=song.file_mr_drum_w,
+        file_mr_drum=song.file_mr_drum,
     )
 
 
@@ -807,6 +833,9 @@ def exclude_rap_sections_from_song(song: SongData) -> SongData:
         artist_origin=song.artist_origin,
         artist_ko=song.artist_ko,
         artist_en=song.artist_en,
+        album_origin=song.album_origin,
+        album_ko=song.album_ko,
+        album_en=song.album_en,
         notes=[note for note in song.notes if not in_rap_range(note.start, note.end)],
         words_part_a=[
             word for word in song.words_part_a if not in_rap_range(word.start, word.end)
@@ -836,6 +865,11 @@ def exclude_rap_sections_from_song(song: SongData) -> SongData:
         original_key=song.original_key,
         file_mr_mel_m=song.file_mr_mel_m,
         file_mr_mel_w=song.file_mr_mel_w,
+        file_mr_har_m=song.file_mr_har_m,
+        file_mr_har_w=song.file_mr_har_w,
+        file_mr_drum_m=song.file_mr_drum_m,
+        file_mr_drum_w=song.file_mr_drum_w,
+        file_mr_drum=song.file_mr_drum,
     )
 
 
@@ -868,6 +902,9 @@ def apply_song_time_offset(song: SongData, offset_ms: int) -> SongData:
         artist_origin=song.artist_origin,
         artist_ko=song.artist_ko,
         artist_en=song.artist_en,
+        album_origin=song.album_origin,
+        album_ko=song.album_ko,
+        album_en=song.album_en,
         notes=[_shift_note(note, offset_ms) for note in song.notes],
         words_part_a=[_shift_lyric_word(word, offset_ms) for word in song.words_part_a],
         words_part_b=[_shift_lyric_word(word, offset_ms) for word in song.words_part_b],
@@ -888,6 +925,11 @@ def apply_song_time_offset(song: SongData, offset_ms: int) -> SongData:
         original_key=song.original_key,
         file_mr_mel_m=song.file_mr_mel_m,
         file_mr_mel_w=song.file_mr_mel_w,
+        file_mr_har_m=song.file_mr_har_m,
+        file_mr_har_w=song.file_mr_har_w,
+        file_mr_drum_m=song.file_mr_drum_m,
+        file_mr_drum_w=song.file_mr_drum_w,
+        file_mr_drum=song.file_mr_drum,
     )
 
 
@@ -918,6 +960,9 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
         artist_origin=_field_value(data, "artist_names", "origin"),
         artist_ko=_field_value(data, "artist_names", "ko"),
         artist_en=_field_value(data, "artist_names", "en"),
+        album_origin=_field_value(data, "album_names", "origin"),
+        album_ko=_field_value(data, "album_names", "ko"),
+        album_en=_field_value(data, "album_names", "en"),
         notes=_parse_notes(mnote["note"]),
         words_part_a=_extract_words(sections, "partA", lyric_field),
         words_part_b=_extract_words(sections, "partB", lyric_field),
@@ -931,6 +976,11 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
         original_key=str(data.get("original_key", "") or "").strip(),
         file_mr_mel_m=str(data.get("file_mr_mel_m", "") or "").strip(),
         file_mr_mel_w=str(data.get("file_mr_mel_w", "") or "").strip(),
+        file_mr_har_m=str(data.get("file_mr_har_m", "") or "").strip(),
+        file_mr_har_w=str(data.get("file_mr_har_w", "") or "").strip(),
+        file_mr_drum_m=str(data.get("file_mr_drum_m", "") or "").strip(),
+        file_mr_drum_w=str(data.get("file_mr_drum_w", "") or "").strip(),
+        file_mr_drum=str(data.get("file_mr_drum", "") or "").strip(),
     )
 
 

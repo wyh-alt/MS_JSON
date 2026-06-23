@@ -392,9 +392,10 @@ class ExportPage(ScrollArea):
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
+        self.navigationInterface.setReturnButtonVisible(False)
         self.setWindowTitle("MS JSON 导出工具")
-        self.resize(1000, 600)
-        self.setMinimumSize(1000, 600)
+        self.resize(1000, 640)
+        self.setMinimumSize(1000, 640)
 
         icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icon.ico")
         if os.path.exists(icon_path):
@@ -402,11 +403,17 @@ class MainWindow(FluentWindow):
 
             self.setWindowIcon(QIcon(icon_path))
 
+        from ui.audio_download_page import AudioDownloadPage
+
+        self.audio_download_page = AudioDownloadPage(self)
+        self.audio_download_page.setObjectName("audioDownloadInterface")
+        self.addSubInterface(self.audio_download_page, FIF.DOWNLOAD, "音频下载")
+
         from ui.lyric_export_page import LyricExportPage
 
         self.lyric_export_page = LyricExportPage(self)
         self.lyric_export_page.setObjectName("lyricExportInterface")
-        self.addSubInterface(self.lyric_export_page, FIF.DOCUMENT, "歌词导出")
+        self.addSubInterface(self.lyric_export_page, FIF.FONT, "歌词导出")
 
         self.export_page = ExportPage(self)
         self.export_page.setObjectName("exportInterface")

@@ -80,6 +80,12 @@ class SongSection:
     highlight: bool = False
 
 
+@dataclass(frozen=True)
+class TempoSegment:
+    bpm: float
+    end_ms: int
+
+
 @dataclass
 class SectionExportInfo:
     name: str
@@ -114,6 +120,7 @@ class SongData:
     sections: list[SongSection] = field(default_factory=list)
     section_export_infos: list[SectionExportInfo] = field(default_factory=list)
     tempo_bpm: float = 120.0
+    tempo_segments: list[TempoSegment] = field(default_factory=list)
     original_key: str = ""
     file_mr_mel_m: str = ""
     file_mr_mel_w: str = ""
@@ -415,10 +422,46 @@ def _extract_lines(sections: list[dict], part_key: str, lyric_field: str) -> lis
     return lines
 
 
+def parse_tempo_segments(tempos: list[dict]) -> list[TempoSegment]:
+    """将 JSON tempos 解析为按 end_ms 递增的分段速度表。"""
+    segments: list[TempoSegment] = []
+    prev_end = 0
+    for item in tempos:
+        tempo = item.get("tempo")
+        end_raw = item.get("end")
+        if tempo is None or end_raw in (None, ""):
+            continue
+        end_ms = int(end_raw)
+        if end_ms > prev_end:
+            segments.append(TempoSegment(bpm=float(tempo), end_ms=end_ms))
+        prev_end = max(prev_end, end_ms)
+    return segments
+
+
+def _tempo_segment_durations(segments: list[TempoSegment]) -> list[tuple[float, int]]:
+    durations: list[tuple[float, int]] = []
+    prev_end = 0
+    for segment in segments:
+        duration_ms = max(0, segment.end_ms - prev_end)
+        if duration_ms > 0:
+            durations.append((segment.bpm, duration_ms))
+        prev_end = max(prev_end, segment.end_ms)
+    return durations
+
+
 def _parse_tempo(tempos: list[dict]) -> float:
     if not tempos:
         return 120.0
-    return float(tempos[0].get("tempo", 120.0))
+    segments = parse_tempo_segments(tempos)
+    durations = _tempo_segment_durations(segments)
+    if not durations:
+        return float(tempos[0].get("tempo", 120.0))
+    best_bpm = float(durations[0][0])
+    best_duration = -1
+    for bpm, duration_ms in durations:
+        if duration_ms >= best_duration:
+            best_bpm, best_duration = bpm, duration_ms
+    return best_bpm
 
 
 def _parse_sections(raw_sections: list[dict]) -> list[SongSection]:
@@ -788,6 +831,7 @@ def _filter_song_by_removed_note_ranges(
         sections=list(song.sections),
         section_export_infos=list(song.section_export_infos),
         tempo_bpm=song.tempo_bpm,
+        tempo_segments=list(song.tempo_segments),
         original_key=song.original_key,
         file_mr_mel_m=song.file_mr_mel_m,
         file_mr_mel_w=song.file_mr_mel_w,
@@ -862,6 +906,7 @@ def exclude_rap_sections_from_song(song: SongData) -> SongData:
         sections=[section for section in song.sections if not is_rap_section(section)],
         section_export_infos=list(song.section_export_infos),
         tempo_bpm=song.tempo_bpm,
+        tempo_segments=list(song.tempo_segments),
         original_key=song.original_key,
         file_mr_mel_m=song.file_mr_mel_m,
         file_mr_mel_w=song.file_mr_mel_w,
@@ -922,6 +967,10 @@ def apply_song_time_offset(song: SongData, offset_ms: int) -> SongData:
             for info in song.section_export_infos
         ],
         tempo_bpm=song.tempo_bpm,
+        tempo_segments=[
+            TempoSegment(bpm=segment.bpm, end_ms=max(0, segment.end_ms + offset_ms))
+            for segment in song.tempo_segments
+        ],
         original_key=song.original_key,
         file_mr_mel_m=song.file_mr_mel_m,
         file_mr_mel_w=song.file_mr_mel_w,
@@ -973,6 +1022,7 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
         sections=_parse_sections(sections),
         section_export_infos=extract_section_export_infos(sections, lyric_field),
         tempo_bpm=_parse_tempo(mnote.get("tempos", [])),
+        tempo_segments=parse_tempo_segments(mnote.get("tempos", [])),
         original_key=str(data.get("original_key", "") or "").strip(),
         file_mr_mel_m=str(data.get("file_mr_mel_m", "") or "").strip(),
         file_mr_mel_w=str(data.get("file_mr_mel_w", "") or "").strip(),

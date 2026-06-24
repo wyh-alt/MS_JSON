@@ -13,6 +13,7 @@ from core.parser import (
     Note,
     SongData,
     SongSection,
+    TempoSegment,
     apply_song_time_offset,
     exclude_non_melody_notes_from_song,
     exclude_rap_sections_from_song,
@@ -263,13 +264,107 @@ def _ms_to_ticks(ms: int, tempo_us: int, ticks_per_beat: int) -> int:
     return int(round(mido.second2tick(ms / 1000.0, ticks_per_beat, tempo_us)))
 
 
-def _resolve_tick_tempo(song: SongData, write_tempo: bool) -> tuple[float, int]:
-    bpm = song.tempo_bpm if write_tempo else DEFAULT_TEMPO_BPM
-    return bpm, mido.bpm2tempo(bpm)
+def _effective_tempo_segments(song: SongData) -> list[TempoSegment]:
+    if song.tempo_segments:
+        return song.tempo_segments
+    fallback_bpm = song.tempo_bpm if song.tempo_bpm > 0 else DEFAULT_TEMPO_BPM
+    return [TempoSegment(bpm=fallback_bpm, end_ms=10**9)]
 
 
-def _abs_ticks(ms: int, tempo_us: int, ticks_per_beat: int) -> int:
-    return _ms_to_ticks(ms, tempo_us, ticks_per_beat)
+def _ms_to_ticks_tempo_map(
+    abs_ms: int,
+    segments: list[TempoSegment],
+    ticks_per_beat: int,
+) -> int:
+    if abs_ms <= 0:
+        return 0
+    if not segments:
+        return _ms_to_ticks(abs_ms, mido.bpm2tempo(DEFAULT_TEMPO_BPM), ticks_per_beat)
+
+    ticks = 0
+    cursor_ms = 0
+    last_bpm = segments[-1].bpm
+
+    for segment in segments:
+        if abs_ms <= cursor_ms:
+            break
+        chunk_end_ms = min(abs_ms, segment.end_ms)
+        chunk_ms = chunk_end_ms - cursor_ms
+        if chunk_ms > 0:
+            tempo_us = mido.bpm2tempo(segment.bpm)
+            ticks += _ms_to_ticks(chunk_ms, tempo_us, ticks_per_beat)
+        cursor_ms = chunk_end_ms
+        if abs_ms <= segment.end_ms:
+            return ticks
+
+    if abs_ms > cursor_ms:
+        tempo_us = mido.bpm2tempo(last_bpm)
+        ticks += _ms_to_ticks(abs_ms - cursor_ms, tempo_us, ticks_per_beat)
+    return ticks
+
+
+def _ms_to_export_ticks(abs_ms: int, song: SongData, *, write_tempo: bool) -> int:
+    """将 JSON 毫秒时间转为导出 MIDI 的绝对 tick。
+
+    写入速度时按完整 tempo map 换算；否则按 120 BPM 反推，保持 wall-clock 毫秒一致。
+    """
+    if abs_ms <= 0:
+        return 0
+    if write_tempo:
+        return _ms_to_ticks_tempo_map(
+            abs_ms,
+            _effective_tempo_segments(song),
+            TICKS_PER_BEAT,
+        )
+    return _ms_to_ticks(abs_ms, mido.bpm2tempo(DEFAULT_TEMPO_BPM), TICKS_PER_BEAT)
+
+
+def _export_ticks_to_ms(abs_tick: int, song: SongData, *, write_tempo: bool) -> int:
+    if abs_tick <= 0:
+        return 0
+    if not write_tempo:
+        tempo_us = mido.bpm2tempo(DEFAULT_TEMPO_BPM)
+        return int(round(mido.tick2second(abs_tick, TICKS_PER_BEAT, tempo_us) * 1000))
+
+    segments = _effective_tempo_segments(song)
+    remaining_tick = abs_tick
+    cursor_ms = 0
+    for index, segment in enumerate(segments):
+        start_ms = 0 if index == 0 else segments[index - 1].end_ms
+        tick_start = _ms_to_ticks_tempo_map(start_ms, segments, TICKS_PER_BEAT)
+        tick_end = _ms_to_ticks_tempo_map(segment.end_ms, segments, TICKS_PER_BEAT)
+        segment_ticks = max(0, tick_end - tick_start)
+        if remaining_tick <= segment_ticks or index == len(segments) - 1:
+            tempo_us = mido.bpm2tempo(segment.bpm)
+            return int(
+                round(
+                    cursor_ms
+                    + mido.tick2second(remaining_tick, TICKS_PER_BEAT, tempo_us) * 1000
+                )
+            )
+        remaining_tick -= segment_ticks
+        cursor_ms = segment.end_ms
+    return cursor_ms
+
+
+def _conductor_tempo_events(song: SongData, *, write_tempo: bool) -> list[tuple[int, int]]:
+    if not write_tempo:
+        return [(0, int(mido.bpm2tempo(DEFAULT_TEMPO_BPM)))]
+
+    segments = _effective_tempo_segments(song)
+    if not segments:
+        return [(0, int(mido.bpm2tempo(DEFAULT_TEMPO_BPM)))]
+
+    events: list[tuple[int, int]] = []
+    for index, segment in enumerate(segments):
+        start_ms = 0 if index == 0 else segments[index - 1].end_ms
+        abs_tick = _ms_to_ticks_tempo_map(start_ms, segments, TICKS_PER_BEAT)
+        events.append((abs_tick, int(mido.bpm2tempo(segment.bpm))))
+    return events
+
+
+def _abs_ticks(ms: int, song: SongData, write_tempo: bool) -> int:
+    return _ms_to_export_ticks(ms, song, write_tempo=write_tempo)
 
 
 def filter_notes(notes: list[Note], part: str) -> list[Note]:
@@ -957,7 +1052,7 @@ def _new_midi_file() -> mido.MidiFile:
 
 
 def _build_conductor_track(song: SongData, *, write_tempo: bool) -> mido.MidiTrack:
-    """参考 KTV MIDI：独立指挥轨，仅含拍号与速度。"""
+    """参考 KTV MIDI：独立指挥轨，含拍号与分段速度。"""
     track = mido.MidiTrack()
     track.append(
         mido.MetaMessage(
@@ -969,8 +1064,16 @@ def _build_conductor_track(song: SongData, *, write_tempo: bool) -> mido.MidiTra
             time=0,
         )
     )
-    bpm = song.tempo_bpm if write_tempo else DEFAULT_TEMPO_BPM
-    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(bpm), time=0))
+    current_tick = 0
+    for abs_tick, tempo_us in _conductor_tempo_events(song, write_tempo=write_tempo):
+        track.append(
+            mido.MetaMessage(
+                "set_tempo",
+                tempo=tempo_us,
+                time=max(abs_tick - current_tick, 0),
+            )
+        )
+        current_tick = abs_tick
     track.append(mido.MetaMessage("end_of_track", time=0))
     return track
 
@@ -1020,8 +1123,9 @@ def _build_note_marker_timeline(
     notes: list[Note],
     sections: list[SongSection],
     lyrics: dict[NoteSignature, str],
-    tick_tempo: int,
+    song: SongData,
     *,
+    write_tempo: bool,
     write_section_markers: bool,
     write_lyrics: bool,
     lower_octave: bool,
@@ -1031,7 +1135,7 @@ def _build_note_marker_timeline(
 
     if write_section_markers:
         for section in sorted(sections, key=lambda item: (item.start, item.seq)):
-            start_ticks = _abs_ticks(section.start, tick_tempo, TICKS_PER_BEAT)
+            start_ticks = _abs_ticks(section.start, song, write_tempo)
             events.append(
                 (
                     start_ticks,
@@ -1046,8 +1150,8 @@ def _build_note_marker_timeline(
 
     for note in sorted(notes, key=lambda n: (n.start, n.end, n.key)):
         pitch = _midi_pitch(note, lower_octave=lower_octave)
-        start_ticks = _abs_ticks(note.start, tick_tempo, TICKS_PER_BEAT)
-        end_ticks = _abs_ticks(note.end, tick_tempo, TICKS_PER_BEAT)
+        start_ticks = _abs_ticks(note.start, song, write_tempo)
+        end_ticks = _abs_ticks(note.end, song, write_tempo)
         lyric = lyrics.get(_note_signature(note)) if write_lyrics else None
 
         if lyric is not None:
@@ -1093,7 +1197,9 @@ def _append_timeline_to_track(
 def _build_lyrics_only_track(
     notes: list[Note],
     lyrics: dict[NoteSignature, str],
-    tick_tempo: int,
+    song: SongData,
+    *,
+    write_tempo: bool,
     track_name: str = "歌词",
 ) -> mido.MidiTrack:
     """独立歌词轨：按音符起始时间排列 lyrics 元事件，供编辑器「歌词」面板读取。"""
@@ -1102,7 +1208,7 @@ def _build_lyrics_only_track(
     current_ticks = 0
 
     for note in sorted(notes, key=lambda n: (n.start, n.end, n.key)):
-        start_ticks = _abs_ticks(note.start, tick_tempo, TICKS_PER_BEAT)
+        start_ticks = _abs_ticks(note.start, song, write_tempo)
         lyric = lyrics.get(_note_signature(note))
         if lyric is None:
             current_ticks = max(current_ticks, start_ticks)
@@ -1118,8 +1224,9 @@ def _append_notes_to_track(
     track: mido.MidiTrack,
     notes: list[Note],
     lyrics: dict[NoteSignature, str],
-    tick_tempo: int,
+    song: SongData,
     *,
+    write_tempo: bool,
     write_lyrics: bool,
     lower_octave: bool,
     initial_ticks: int = 0,
@@ -1129,8 +1236,8 @@ def _append_notes_to_track(
 
     for note in notes:
         pitch = _midi_pitch(note, lower_octave=lower_octave)
-        start_ticks = _abs_ticks(note.start, tick_tempo, TICKS_PER_BEAT)
-        end_ticks = _abs_ticks(note.end, tick_tempo, TICKS_PER_BEAT)
+        start_ticks = _abs_ticks(note.start, song, write_tempo)
+        end_ticks = _abs_ticks(note.end, song, write_tempo)
         delta_on = max(start_ticks - current_ticks, 0)
         duration_ticks = max(end_ticks - start_ticks, 1)
         lyric = lyrics.get(_note_signature(note)) if write_lyrics else None
@@ -1155,9 +1262,9 @@ def _build_melody_track(
     notes: list[Note],
     song: SongData,
     part: str,
-    tick_tempo: int,
-    track_name: str,
     *,
+    write_tempo: bool,
+    track_name: str,
     write_lyrics: bool,
     lyric_granularity: LyricGranularity,
     lower_octave: bool,
@@ -1180,7 +1287,8 @@ def _build_melody_track(
             notes,
             song.sections,
             lyric_map,
-            tick_tempo,
+            song,
+            write_tempo=write_tempo,
             write_section_markers=True,
             write_lyrics=write_lyrics,
             lower_octave=lower_octave,
@@ -1191,7 +1299,8 @@ def _build_melody_track(
             track,
             notes,
             lyric_map,
-            tick_tempo,
+            song,
+            write_tempo=write_tempo,
             write_lyrics=write_lyrics,
             lower_octave=lower_octave,
         )
@@ -1229,7 +1338,6 @@ def _export_single_part(
     if not notes and not allow_empty:
         raise ValueError(f"{track_name} 没有可导出的音符")
 
-    _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
     midi = _assemble_midi(
         song,
         [
@@ -1237,8 +1345,8 @@ def _export_single_part(
                 notes,
                 song,
                 part,
-                tick_tempo,
-                track_name,
+                write_tempo=write_tempo,
+                track_name=track_name,
                 write_lyrics=write_lyrics and bool(notes),
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,
@@ -1277,7 +1385,6 @@ def _export_merge_same_track(
         else {}
     )
 
-    _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
     melody = mido.MidiTrack()
     melody.append(mido.MetaMessage("track_name", name="合并同轨", time=0))
     if write_section_markers and song.sections:
@@ -1285,7 +1392,8 @@ def _export_merge_same_track(
             combined,
             song.sections,
             lyric_map,
-            tick_tempo,
+            song,
+            write_tempo=write_tempo,
             write_section_markers=True,
             write_lyrics=write_lyrics,
             lower_octave=lower_octave,
@@ -1296,7 +1404,8 @@ def _export_merge_same_track(
             melody,
             combined,
             lyric_map,
-            tick_tempo,
+            song,
+            write_tempo=write_tempo,
             write_lyrics=write_lyrics,
             lower_octave=lower_octave,
         )
@@ -1321,7 +1430,6 @@ def _export_merge_multi_track(
     if not notes_a and not notes_b and not notes_other:
         raise ValueError("没有可导出的音符")
 
-    _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
     melody_tracks: list[mido.MidiTrack] = []
 
     part_tracks: list[tuple[list[Note], str, str, bool]] = []
@@ -1339,8 +1447,8 @@ def _export_merge_multi_track(
                 notes,
                 song,
                 part,
-                tick_tempo,
-                track_name,
+                write_tempo=write_tempo,
+                track_name=track_name,
                 write_lyrics=part_write_lyrics,
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,
@@ -1375,7 +1483,6 @@ def _export_lyric_lang_split_tracks(
     if not scripts_present:
         raise ValueError("未找到可分类的原文字词，无法按语种分轨")
 
-    _, tick_tempo = _resolve_tick_tempo(song, write_tempo)
     melody_tracks: list[mido.MidiTrack] = []
     track_index = 0
     for script in scripts_present:
@@ -1391,8 +1498,8 @@ def _export_lyric_lang_split_tracks(
                 script_notes,
                 song,
                 "merge",
-                tick_tempo,
-                track_label,
+                write_tempo=write_tempo,
+                track_name=track_label,
                 write_lyrics=write_lyrics,
                 lyric_granularity=lyric_granularity,
                 lower_octave=lower_octave,

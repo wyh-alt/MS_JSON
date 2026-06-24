@@ -12,10 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.midi_exporter import (  # noqa: E402
-    TICKS_PER_BEAT,
-    DEFAULT_TEMPO_BPM,
-    _resolve_tick_tempo,
     _abs_ticks,
+    _export_ticks_to_ms,
     export_song,
     filter_notes,
     _dedupe_notes,
@@ -32,8 +30,8 @@ class TrackEvent:
     value: str | int
 
 
-def _ticks_to_ms(tick: int, tempo_us: int, ticks_per_beat: int) -> int:
-    return int(round(mido.tick2second(tick, ticks_per_beat, tempo_us) * 1000))
+def _ticks_to_ms(tick: int, song, write_tempo: bool) -> int:
+    return _export_ticks_to_ms(tick, song, write_tempo=write_tempo)
 
 
 def _read_track_events(track: mido.MidiTrack) -> list[TrackEvent]:
@@ -46,20 +44,6 @@ def _read_track_events(track: mido.MidiTrack) -> list[TrackEvent]:
         elif msg.type == "marker":
             events.append(TrackEvent(tick, "marker", msg.text))
     return events
-
-
-def _track_tempo_us(midi: mido.MidiFile, track_index: int, default_tempo_us: int) -> int:
-    tempo = default_tempo_us
-    for msg in midi.tracks[track_index]:
-        if msg.type == "set_tempo":
-            tempo = msg.tempo
-    return tempo
-
-
-def _conductor_tempo_us(midi: mido.MidiFile, default_tempo_us: int) -> int:
-    if not midi.tracks:
-        return default_tempo_us
-    return _track_tempo_us(midi, 0, default_tempo_us)
 
 
 def _find_track_index_by_name(midi: mido.MidiFile, name: str) -> int | None:
@@ -99,10 +83,10 @@ def verify_export(
     write_tempo: bool = False,
     write_section_markers: bool = True,
     time_offset_ms: int = 0,
+    audio_reference_calibration: bool = False,
 ) -> list[str]:
     issues: list[str] = []
     song = apply_song_time_offset(load_song_json(json_path), time_offset_ms)
-    _, export_tempo_us = _resolve_tick_tempo(song, write_tempo)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         paths = export_song(
@@ -113,6 +97,7 @@ def verify_export(
             write_lyrics=False,
             write_section_markers=write_section_markers,
             time_offset_ms=time_offset_ms,
+            audio_reference_calibration=audio_reference_calibration,
         )
 
         for midi_path in paths:
@@ -140,7 +125,6 @@ def verify_export(
                         )
 
                 for track_index, track_suffix, expected in part_by_track:
-                    tempo_us = _conductor_tempo_us(midi, export_tempo_us)
                     events = _read_track_events(midi.tracks[track_index])
                     first_melody = _first_melody_track_index(midi)
                     markers_on_track = (
@@ -153,8 +137,8 @@ def verify_export(
                         events,
                         expected,
                         song.sections if markers_on_track else None,
-                        export_tempo_us,
-                        tempo_us,
+                        song,
+                        write_tempo,
                     )
                 continue
 
@@ -169,7 +153,6 @@ def verify_export(
                     continue
                 track_index = _first_melody_track_index(midi)
                 events = _read_track_events(midi.tracks[track_index])
-                tempo_us = _conductor_tempo_us(midi, export_tempo_us)
                 _check_events(
                     issues,
                     json_path,
@@ -177,15 +160,14 @@ def verify_export(
                     events,
                     expected,
                     song.sections if write_section_markers else None,
-                    export_tempo_us,
-                    tempo_us,
+                    song,
+                    write_tempo,
                 )
                 continue
 
             expected = _expected_notes(song, part_mode)
             track_index = _first_melody_track_index(midi)
             events = _read_track_events(midi.tracks[track_index])
-            tempo_us = _conductor_tempo_us(midi, export_tempo_us)
             _check_events(
                 issues,
                 json_path,
@@ -193,8 +175,8 @@ def verify_export(
                 events,
                 expected,
                 song.sections if write_section_markers else None,
-                export_tempo_us,
-                tempo_us,
+                song,
+                write_tempo,
             )
 
     return issues
@@ -207,8 +189,8 @@ def _check_events(
     events: list[TrackEvent],
     expected_notes,
     expected_sections,
-    export_tempo_us: int,
-    tempo_us: int,
+    song,
+    write_tempo: bool,
 ) -> None:
     if expected_sections is not None:
         markers = [e for e in events if e.kind == "marker"]
@@ -218,11 +200,9 @@ def _check_events(
                 f"{len(markers)} != JSON {len(expected_sections)}"
             )
         for section, marker in zip(expected_sections, markers):
-            expected_tick = _abs_ticks(
-                section.start, export_tempo_us, TICKS_PER_BEAT
-            )
+            expected_tick = _abs_ticks(section.start, song, write_tempo)
             if marker.tick != expected_tick:
-                got_ms = _ticks_to_ms(marker.tick, tempo_us, TICKS_PER_BEAT)
+                got_ms = _ticks_to_ms(marker.tick, song, write_tempo)
                 exp_ms = section.start
                 if abs(got_ms - exp_ms) > MS_TOLERANCE_MS:
                     issues.append(
@@ -242,9 +222,9 @@ def _check_events(
         return
 
     for note, event in zip(expected_sorted, note_events):
-        expected_tick = _abs_ticks(note.start, export_tempo_us, TICKS_PER_BEAT)
+        expected_tick = _abs_ticks(note.start, song, write_tempo)
         if event.tick != expected_tick:
-            got_ms = _ticks_to_ms(event.tick, tempo_us, TICKS_PER_BEAT)
+            got_ms = _ticks_to_ms(event.tick, song, write_tempo)
             exp_ms = note.start
             if abs(got_ms - exp_ms) > MS_TOLERANCE_MS:
                 issues.append(

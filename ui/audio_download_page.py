@@ -31,7 +31,7 @@ from core.audio_downloader import (
 )
 from core.lyric_exporter import META_LANG_LABELS
 from core.parser import collect_json_files, load_song_json
-from ui.widgets import DragLineEdit, create_compact_combo
+from ui.widgets import BatchProgressPanel, DragLineEdit, create_compact_combo
 
 
 @dataclass
@@ -213,6 +213,9 @@ class AudioDownloadPage(ScrollArea):
         output_layout.addLayout(output_row)
         layout.addWidget(output_card)
 
+        self.progress_panel = BatchProgressPanel(container)
+        layout.addWidget(self.progress_panel)
+
         action_row = QHBoxLayout()
         self.export_btn = PrimaryPushButton("开始下载", container)
         self.export_btn.clicked.connect(self._start_export)
@@ -338,6 +341,7 @@ class AudioDownloadPage(ScrollArea):
         options = self._build_options()
 
         self.export_btn.setEnabled(False)
+        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备下载…")
         InfoBar.info(
             "开始下载",
             f"共 {len(json_paths)} 个 JSON，请稍候…",
@@ -355,12 +359,12 @@ class AudioDownloadPage(ScrollArea):
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
-    def _on_progress(self, _value: int, message: str):
-        self.export_btn.setText(message)
+    def _on_progress(self, value: int, message: str):
+        self.progress_panel.update(value, message)
 
     def _on_finished(self, result: AudioDownloadResult):
         self.export_btn.setEnabled(True)
-        self.export_btn.setText("开始下载")
+        self.progress_panel.finish()
 
         if result.success and not result.failed:
             InfoBar.success(

@@ -27,7 +27,7 @@ from core.lyric_exporter import (
     write_sections_excel,
 )
 from core.parser import collect_json_files, load_song_json
-from ui.widgets import DragLineEdit, create_compact_combo, create_offset_spinbox
+from ui.widgets import BatchProgressPanel, DragLineEdit, create_compact_combo, create_offset_spinbox
 
 LYRIC_FIELD_OPTIONS = [
     ("原文歌词", "ori"),
@@ -272,6 +272,9 @@ class LyricExportPage(ScrollArea):
         output_layout.addLayout(output_row)
         layout.addWidget(output_card)
 
+        self.progress_panel = BatchProgressPanel(container)
+        layout.addWidget(self.progress_panel)
+
         action_row = QHBoxLayout()
         self.section_export_btn = PushButton("导出段落信息", container)
         self.section_export_btn.clicked.connect(self._start_section_export)
@@ -355,8 +358,7 @@ class LyricExportPage(ScrollArea):
         self.export_btn.setEnabled(enabled)
         self.section_export_btn.setEnabled(enabled)
         if enabled:
-            self.export_btn.setText("开始导出")
-            self.section_export_btn.setText("导出段落信息")
+            self.progress_panel.finish()
 
     def _start_section_export(self):
         json_paths = self._validate_export_paths()
@@ -371,6 +373,7 @@ class LyricExportPage(ScrollArea):
         audio_reference_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_export_buttons_enabled(False)
+        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备导出段落信息…")
         InfoBar.info(
             "开始导出段落信息",
             f"共 {len(json_paths)} 个 JSON，请稍候…",
@@ -392,8 +395,8 @@ class LyricExportPage(ScrollArea):
         self.section_worker.finished.connect(self._on_section_finished)
         self.section_worker.start()
 
-    def _on_section_progress(self, _value: int, message: str):
-        self.section_export_btn.setText(message)
+    def _on_section_progress(self, value: int, message: str):
+        self.progress_panel.update(value, message)
 
     def _on_section_finished(self, result: SectionExportResult):
         self._set_export_buttons_enabled(True)
@@ -435,6 +438,7 @@ class LyricExportPage(ScrollArea):
         audio_reference_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_export_buttons_enabled(False)
+        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备导出…")
         InfoBar.info(
             "开始导出",
             f"共 {len(json_paths)} 个 JSON，请稍候…",
@@ -459,8 +463,8 @@ class LyricExportPage(ScrollArea):
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
-    def _on_progress(self, _value: int, message: str):
-        self.export_btn.setText(message)
+    def _on_progress(self, value: int, message: str):
+        self.progress_panel.update(value, message)
 
     def _on_finished(self, result: LyricExportResult):
         self._set_export_buttons_enabled(True)

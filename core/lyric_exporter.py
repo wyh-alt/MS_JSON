@@ -341,6 +341,7 @@ def export_song_lyrics(
 
 
 SECTION_EXPORT_HEADERS = (
+    "伴奏ID",
     "歌名",
     "歌手",
     "段落类型",
@@ -378,7 +379,7 @@ def collect_section_export_rows(
     artist_lang: str,
     time_offset_ms: int = 0,
     audio_reference_calibration: bool = True,
-) -> list[tuple[str, str, str, str, str, str, str]]:
+) -> list[tuple[str, str, str, str, str, str, str, str]]:
     from core.audio_calibration import resolve_export_time_offset
 
     total_offset_ms, _, _ = resolve_export_time_offset(
@@ -388,7 +389,7 @@ def collect_section_export_rows(
     )
     title = resolve_title(song, title_lang)
     artist = resolve_artist(song, artist_lang) or ""
-    rows: list[tuple[str, str, str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str, str]] = []
     for info in song.section_export_infos:
         start_ms, end_ms = _section_export_times(
             info.section_start_ms,
@@ -397,6 +398,7 @@ def collect_section_export_rows(
         )
         rows.append(
             (
+                str(song.mr_id),
                 title,
                 artist,
                 format_section_display_name(info.name),
@@ -410,7 +412,7 @@ def collect_section_export_rows(
 
 
 def write_sections_excel(
-    rows: list[tuple[str, str, str, str, str, str, str]],
+    rows: list[tuple[str, str, str, str, str, str, str, str]],
     output_dir: str,
 ) -> str:
     try:
@@ -456,7 +458,7 @@ def export_sections_excel(
     artist_lang: str,
     time_offset_ms: int = 0,
 ) -> str:
-    all_rows: list[tuple[str, str, str, str, str, str, str]] = []
+    all_rows: list[tuple[str, str, str, str, str, str, str, str]] = []
     for path in json_paths:
         song = load_song_json(path, lyric_field)
         all_rows.extend(

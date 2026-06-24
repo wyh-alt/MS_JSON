@@ -21,7 +21,7 @@ from qfluentwidgets import (
 
 from core.midi_exporter import LYRIC_GRANULARITY_LABELS, PART_MODE_LABELS, export_song
 from core.parser import collect_json_files, load_song_json
-from ui.widgets import DragLineEdit, create_compact_combo, create_offset_spinbox
+from ui.widgets import BatchProgressPanel, DragLineEdit, create_compact_combo, create_offset_spinbox
 
 LYRIC_FIELD_OPTIONS = [
     ("原文歌词", "ori"),
@@ -234,6 +234,9 @@ class ExportPage(ScrollArea):
         output_layout.addLayout(output_row)
         layout.addWidget(output_card)
 
+        self.progress_panel = BatchProgressPanel(container)
+        layout.addWidget(self.progress_panel)
+
         action_row = QHBoxLayout()
         self.export_btn = PrimaryPushButton("开始导出", container)
         self.export_btn.clicked.connect(self._start_export)
@@ -316,6 +319,7 @@ class ExportPage(ScrollArea):
             return
 
         self.export_btn.setEnabled(False)
+        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备导出…")
         InfoBar.info(
             "开始导出",
             f"共 {len(json_paths)} 个 JSON，请稍候…",
@@ -343,12 +347,12 @@ class ExportPage(ScrollArea):
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
-    def _on_progress(self, _value: int, message: str):
-        self.export_btn.setText(message)
+    def _on_progress(self, value: int, message: str):
+        self.progress_panel.update(value, message)
 
     def _on_finished(self, result: ExportResult):
         self.export_btn.setEnabled(True)
-        self.export_btn.setText("开始导出")
+        self.progress_panel.finish()
 
         if result.success and not result.failed:
             detail = f"成功导出 {len(result.success)} 个 MIDI 文件。"
@@ -408,6 +412,12 @@ class MainWindow(FluentWindow):
         self.audio_download_page = AudioDownloadPage(self)
         self.audio_download_page.setObjectName("audioDownloadInterface")
         self.addSubInterface(self.audio_download_page, FIF.DOWNLOAD, "音频下载")
+
+        from ui.metadata_export_page import MetadataExportPage
+
+        self.metadata_export_page = MetadataExportPage(self)
+        self.metadata_export_page.setObjectName("metadataExportInterface")
+        self.addSubInterface(self.metadata_export_page, FIF.INFO, "元数据提取")
 
         from ui.lyric_export_page import LyricExportPage
 

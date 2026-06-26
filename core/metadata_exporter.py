@@ -15,7 +15,7 @@ from core.parser import SongData, is_valid_ms_json, load_song_json
 METADATA_EXCEL_NAME = "曲目元数据.xlsx"
 
 METADATA_HEADERS: tuple[str, ...] = (
-    "伴奏ID",
+    "MSID",
     "原文歌名",
     "韩文歌名",
     "英文歌名",
@@ -74,6 +74,20 @@ class MetadataExportResult:
     success_count: int
     failed: list[tuple[str, str]]
     download_errors: list[str]
+
+
+def _resource_basename(mr_id: int, field_name: str) -> str:
+    """音频类资源文件名（与音频下载命名一致）。"""
+    mapping = {
+        "file_mr_har_m": f"{mr_id}-m",
+        "file_mr_har_w": f"{mr_id}-w",
+        "file_mr_mel_m": f"{mr_id}-m-mel",
+        "file_mr_mel_w": f"{mr_id}-w-mel",
+        "file_mr_drum": f"{mr_id}-Drum",
+        "file_mr_drum_m": f"{mr_id}-Drum",
+        "file_mr_drum_w": f"{mr_id}-Drum",
+    }
+    return mapping.get(field_name, str(mr_id))
 
 
 def _suffix_from_url(url: str, default: str) -> str:
@@ -183,18 +197,18 @@ def _save_resource(
             except urllib.error.URLError as exc:
                 raise FileNotFoundError(f"下载失败: {value} ({exc})") from exc
             suffix = _detect_image_suffix(data, content_type)
-            dest_path = dest_dir / f"{mr_id}{suffix}"
+            dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
             _write_bytes_atomic(dest_path, data)
         else:
             suffix = _suffix_from_url(value, default_suffix)
-            dest_path = dest_dir / f"{mr_id}{suffix}"
+            dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
             try:
                 _download_url_to_file(value, dest_path)
             except urllib.error.URLError as exc:
                 raise FileNotFoundError(f"下载失败: {value} ({exc})") from exc
     else:
         suffix = _suffix_from_url(value, default_suffix)
-        dest_path = dest_dir / f"{mr_id}{suffix}"
+        dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
         source = _resolve_local_source(value, json_path)
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, dest_path)

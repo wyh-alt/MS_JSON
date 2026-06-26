@@ -1307,15 +1307,16 @@ def _build_melody_track(
     return track
 
 
-def _output_path(output_dir: str, song: SongData, suffix: str) -> str:
-    filename = f"{_sanitize_filename(song.title)}_{song.mr_id}-{suffix}.mid"
+def _output_path(output_dir: str, song: SongData, name_suffix: str = "") -> str:
+    suffix = f"-{name_suffix}" if name_suffix else ""
+    filename = f"{song.mr_id}-MIDI{suffix}.mid"
     path = os.path.join(output_dir, filename)
     os.makedirs(output_dir, exist_ok=True)
     return path
 
 
-def _save_midi(midi: mido.MidiFile, song: SongData, output_dir: str, suffix: str) -> str:
-    output_path = _output_path(output_dir, song, suffix)
+def _save_midi(midi: mido.MidiFile, song: SongData, output_dir: str, name_suffix: str = "") -> str:
+    output_path = _output_path(output_dir, song, name_suffix)
     midi.save(output_path)
     return output_path
 
@@ -1324,7 +1325,7 @@ def _export_single_part(
     song: SongData,
     output_dir: str,
     part: str,
-    suffix: str,
+    name_suffix: str,
     track_name: str,
     *,
     write_tempo: bool,
@@ -1355,7 +1356,7 @@ def _export_single_part(
         ],
         write_tempo=write_tempo,
     )
-    return _save_midi(midi, song, output_dir, suffix)
+    return _save_midi(midi, song, output_dir, name_suffix)
 
 
 def _export_merge_same_track(
@@ -1411,7 +1412,7 @@ def _export_merge_same_track(
         )
 
     midi = _assemble_midi(song, [melody], write_tempo=write_tempo)
-    return _save_midi(midi, song, output_dir, "合并同轨")
+    return _save_midi(midi, song, output_dir)
 
 
 def _export_merge_multi_track(
@@ -1457,7 +1458,7 @@ def _export_merge_multi_track(
         )
 
     midi = _assemble_midi(song, melody_tracks, write_tempo=write_tempo)
-    return _save_midi(midi, song, output_dir, "合并分轨")
+    return _save_midi(midi, song, output_dir)
 
 
 def _export_lyric_lang_split_tracks(
@@ -1513,7 +1514,7 @@ def _export_lyric_lang_split_tracks(
         raise ValueError("没有可导出的语种类别")
 
     midi = _assemble_midi(song, melody_tracks, write_tempo=write_tempo)
-    return _save_midi(midi, song, output_dir, "歌词语种分轨")
+    return _save_midi(midi, song, output_dir)
 
 
 def _prepare_song_for_export(
@@ -1581,8 +1582,8 @@ def export_song(
             raise ValueError("没有可导出的音符")
 
         separate_parts: list[tuple[str, str, str, bool]] = [
-            ("A", "A声部", "A声部", write_lyrics),
-            ("B", "B声部", "B声部", write_lyrics),
+            ("A", "PartA", "A声部", write_lyrics),
+            ("B", "PartB", "B声部", write_lyrics),
             ("O", "Other", "Other", False),
         ]
         return [
@@ -1590,7 +1591,7 @@ def export_song(
                 song,
                 output_dir,
                 part,
-                suffix,
+                name_suffix,
                 track_name,
                 write_tempo=write_tempo,
                 write_lyrics=part_write_lyrics,
@@ -1599,7 +1600,7 @@ def export_song(
                 write_section_markers=write_section_markers,
                 allow_empty=True,
             )
-            for part, suffix, track_name, part_write_lyrics in separate_parts
+            for part, name_suffix, track_name, part_write_lyrics in separate_parts
         ]
 
     if part_mode == "male_only":
@@ -1608,7 +1609,7 @@ def export_song(
                 song,
                 output_dir,
                 "A",
-                "A声部",
+                "PartA",
                 "A声部",
                 write_tempo=write_tempo,
                 write_lyrics=write_lyrics,
@@ -1624,7 +1625,7 @@ def export_song(
                 song,
                 output_dir,
                 "B",
-                "B声部",
+                "PartB",
                 "B声部",
                 write_tempo=write_tempo,
                 write_lyrics=write_lyrics,

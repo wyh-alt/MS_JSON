@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from core.parser import SongData, resolve_album, resolve_artist, resolve_title
+from core.parser import SongData
 
 AudioContent = Literal[
     "merge_har_drum",
@@ -25,7 +25,6 @@ AudioContent = Literal[
 KeyMode = Literal["original", "male", "female"]
 OutputFormat = Literal["wav", "mp3", "m4a", "flac"]
 M4aCodec = Literal["aac", "alac"]
-NamingFormat = Literal["title-artist", "title-artist-album", "id-title-artist", "id"]
 
 AUDIO_CONTENT_LABELS: list[tuple[str, AudioContent]] = [
     ("合并伴奏（harmony+drum）", "merge_har_drum"),
@@ -79,13 +78,6 @@ M4A_CODEC_LABELS: list[tuple[str, M4aCodec]] = [
     ("ALAC", "alac"),
 ]
 
-NAMING_FORMAT_LABELS: list[tuple[str, NamingFormat]] = [
-    ("歌名-歌手", "title-artist"),
-    ("歌名-歌手-专辑", "title-artist-album"),
-    ("ID-歌名-歌手", "id-title-artist"),
-    ("ID", "id"),
-]
-
 _TRACK_FIELD_NAMES = {
     "mel": ("file_mr_mel_m", "file_mr_mel_w"),
     "har": ("file_mr_har_m", "file_mr_har_w"),
@@ -121,10 +113,10 @@ class AudioDownloadOptions:
     pcm_bit_depth: int = 16
     bitrate_kbps: int = 320
     m4a_codec: M4aCodec = "aac"
-    naming_format: NamingFormat = "title-artist"
-    title_lang: str = "origin"
-    artist_lang: str = "origin"
-    album_lang: str = "origin"
+    loudness_enabled: bool = False
+    loudness_lufs: float = -12.0
+    limiter_enabled: bool = False
+    limiter_db: float = -1.0
 
 
 def resolve_key_suffix(key_mode: KeyMode, original_key: str) -> str:
@@ -194,16 +186,18 @@ def _sanitize_filename(name: str) -> str:
 
 
 def build_output_filename(song: SongData, options: AudioDownloadOptions) -> str:
-    title = _sanitize_filename(resolve_title(song, options.title_lang))
-    artist = _sanitize_filename(resolve_artist(song, options.artist_lang))
-    album = _sanitize_filename(resolve_album(song, options.album_lang))
+    key_suffix = resolve_key_suffix(options.key_mode, song.original_key)
 
-    if options.naming_format == "title-artist":
-        base = f"{title}-{artist}"
-    elif options.naming_format == "title-artist-album":
-        base = f"{title}-{artist}-{album}" if album != "unknown" else f"{title}-{artist}"
-    elif options.naming_format == "id-title-artist":
-        base = f"{song.mr_id}-{title}-{artist}"
+    if options.content == "merge_har_drum":
+        base = f"{song.mr_id}-完整伴奏"
+    elif options.content == "merge_har_drum_mel":
+        base = f"{song.mr_id}-完整伴奏-mel"
+    elif options.content == "har":
+        base = f"{song.mr_id}-{key_suffix}"
+    elif options.content == "mel":
+        base = f"{song.mr_id}-{key_suffix}-mel"
+    elif options.content == "drum":
+        base = f"{song.mr_id}-Drum"
     else:
         base = str(song.mr_id)
 
@@ -279,6 +273,20 @@ def _pcm_codec(bit_depth: int) -> str:
     return "pcm_s16le" if bit_depth == 16 else "pcm_s24le"
 
 
+def _postprocess_filter_chain(options: AudioDownloadOptions) -> list[str]:
+    chain: list[str] = []
+    limit_db: float | None = None
+    if options.limiter_enabled:
+        limit_db = options.limiter_db if options.limiter_db < 0 else -abs(options.limiter_db)
+    if options.loudness_enabled:
+        target_lufs = options.loudness_lufs if options.loudness_lufs < 0 else -abs(options.loudness_lufs)
+        true_peak = limit_db if limit_db is not None else -1.5
+        chain.append(f"loudnorm=I={target_lufs}:LRA=11:TP={true_peak}")
+    if limit_db is not None:
+        chain.append(f"alimiter=limit={limit_db}dB:attack=5:release=50:level=disabled")
+    return chain
+
+
 def _build_ffmpeg_output_args(options: AudioDownloadOptions) -> list[str]:
     args = ["-ar", str(options.sample_rate)]
     fmt = options.output_format
@@ -317,15 +325,12 @@ def _run_ffmpeg(args: list[str]) -> None:
 
 
 def _export_single_source(source: Path, output_path: Path, options: AudioDownloadOptions) -> None:
-    _run_ffmpeg(
-        [
-            "-y",
-            "-i",
-            str(source),
-            *_build_ffmpeg_output_args(options),
-            str(output_path),
-        ]
-    )
+    args = ["-y", "-i", str(source)]
+    post_filters = _postprocess_filter_chain(options)
+    if post_filters:
+        args.extend(["-af", ",".join(post_filters)])
+    args.extend([*_build_ffmpeg_output_args(options), str(output_path)])
+    _run_ffmpeg(args)
 
 
 def _mix_and_export(sources: list[Path], output_path: Path, options: AudioDownloadOptions) -> None:
@@ -334,19 +339,25 @@ def _mix_and_export(sources: list[Path], output_path: Path, options: AudioDownlo
         input_args.extend(["-i", str(source)])
 
     filter_inputs = "".join(f"[{index}:a]" for index in range(len(sources)))
-    filter_complex = (
+    segments = [
         f"{filter_inputs}amix=inputs={len(sources)}"
-        ":duration=longest:dropout_transition=0:normalize=0[aout]"
-    )
+        f":duration=longest:dropout_transition=0:normalize=0[a0]"
+    ]
+    output_label = "[a0]"
+    post_filters = _postprocess_filter_chain(options)
+    for index, post_filter in enumerate(post_filters):
+        next_label = f"[p{index}]"
+        segments.append(f"{output_label}{post_filter}{next_label}")
+        output_label = next_label
 
     _run_ffmpeg(
         [
             "-y",
             *input_args,
             "-filter_complex",
-            filter_complex,
+            ";".join(segments),
             "-map",
-            "[aout]",
+            output_label,
             *_build_ffmpeg_output_args(options),
             str(output_path),
         ]

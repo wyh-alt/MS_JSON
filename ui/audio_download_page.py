@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
     CardWidget,
+    CheckBox,
     InfoBar,
     InfoBarPosition,
     MessageBox,
@@ -22,16 +23,20 @@ from core.audio_downloader import (
     M4A_BITRATE_LABELS,
     M4A_CODEC_LABELS,
     MP3_BITRATE_LABELS,
-    NAMING_FORMAT_LABELS,
     OUTPUT_FORMAT_LABELS,
     PCM_BIT_DEPTH_LABELS,
     SAMPLE_RATE_LABELS,
     AudioDownloadOptions,
     export_song_audio,
 )
-from core.lyric_exporter import META_LANG_LABELS
 from core.parser import collect_json_files, load_song_json
-from ui.widgets import BatchProgressPanel, DragLineEdit, create_compact_combo
+from ui.widgets import (
+    COMPACT_CONTROL_HEIGHT,
+    BatchProgressPanel,
+    DragLineEdit,
+    create_compact_combo,
+    create_signed_value_input,
+)
 
 
 @dataclass
@@ -179,25 +184,40 @@ class AudioDownloadPage(ScrollArea):
         format_row.addStretch(1)
         output_option_layout.addLayout(format_row)
 
-        naming_row = QHBoxLayout()
-        naming_row.setSpacing(8)
-        naming_row.addWidget(BodyLabel("命名格式:"))
-        self.naming_combo = create_compact_combo(output_option_card, min_width=140, max_width=180)
-        for label, _ in NAMING_FORMAT_LABELS:
-            self.naming_combo.addItem(label)
-        naming_row.addWidget(self.naming_combo)
-        naming_row.addWidget(BodyLabel("歌名:"))
-        self.title_lang_combo = create_compact_combo(output_option_card, min_width=72, max_width=96)
-        for label, _ in META_LANG_LABELS:
-            self.title_lang_combo.addItem(label)
-        naming_row.addWidget(self.title_lang_combo)
-        naming_row.addWidget(BodyLabel("歌手:"))
-        self.artist_lang_combo = create_compact_combo(output_option_card, min_width=72, max_width=96)
-        for label, _ in META_LANG_LABELS:
-            self.artist_lang_combo.addItem(label)
-        naming_row.addWidget(self.artist_lang_combo)
-        naming_row.addStretch(1)
-        output_option_layout.addLayout(naming_row)
+        loudness_row = QHBoxLayout()
+        loudness_row.setSpacing(8)
+        loudness_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.loudness_checkbox = CheckBox("响度处理", output_option_card)
+        self.loudness_checkbox.setFixedHeight(COMPACT_CONTROL_HEIGHT)
+        loudness_row.addWidget(self.loudness_checkbox)
+        self.loudness_spin = create_signed_value_input(
+            output_option_card,
+            minimum=-48,
+            maximum=-1,
+            value=-12,
+            suffix="LUFS",
+        )
+        loudness_row.addWidget(self.loudness_spin)
+        loudness_row.addStretch(1)
+        output_option_layout.addLayout(loudness_row)
+
+        limiter_row = QHBoxLayout()
+        limiter_row.setSpacing(8)
+        limiter_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.limiter_checkbox = CheckBox("限幅处理", output_option_card)
+        self.limiter_checkbox.setFixedHeight(COMPACT_CONTROL_HEIGHT)
+        limiter_row.addWidget(self.limiter_checkbox)
+        self.limiter_spin = create_signed_value_input(
+            output_option_card,
+            minimum=-24,
+            maximum=-1,
+            value=-1,
+            suffix="dB",
+        )
+        limiter_row.addWidget(self.limiter_spin)
+        limiter_row.addStretch(1)
+        output_option_layout.addLayout(limiter_row)
+
         layout.addWidget(output_option_card)
 
         output_card = CardWidget(container)
@@ -227,7 +247,17 @@ class AudioDownloadPage(ScrollArea):
         self.worker: AudioDownloadWorker | None = None
         self.format_combo.currentIndexChanged.connect(self._update_format_options)
         self.m4a_codec_combo.currentIndexChanged.connect(self._update_format_options)
+        self.loudness_checkbox.toggled.connect(self._update_loudness_controls)
+        self.limiter_checkbox.toggled.connect(self._update_limiter_controls)
         self._update_format_options()
+        self._update_loudness_controls()
+        self._update_limiter_controls()
+
+    def _update_loudness_controls(self):
+        self.loudness_spin.setEnabled(self.loudness_checkbox.isChecked())
+
+    def _update_limiter_controls(self):
+        self.limiter_spin.setEnabled(self.limiter_checkbox.isChecked())
 
     def _current_output_format(self) -> str:
         return OUTPUT_FORMAT_LABELS[self.format_combo.currentIndex()][1]
@@ -290,9 +320,10 @@ class AudioDownloadPage(ScrollArea):
             pcm_bit_depth=PCM_BIT_DEPTH_LABELS[self.pcm_combo.currentIndex()][1],
             bitrate_kbps=bitrate_kbps,
             m4a_codec=M4A_CODEC_LABELS[self.m4a_codec_combo.currentIndex()][1],
-            naming_format=NAMING_FORMAT_LABELS[self.naming_combo.currentIndex()][1],
-            title_lang=META_LANG_LABELS[self.title_lang_combo.currentIndex()][1],
-            artist_lang=META_LANG_LABELS[self.artist_lang_combo.currentIndex()][1],
+            loudness_enabled=self.loudness_checkbox.isChecked(),
+            loudness_lufs=float(self.loudness_spin.value()),
+            limiter_enabled=self.limiter_checkbox.isChecked(),
+            limiter_db=float(self.limiter_spin.value()),
         )
 
     def _validate_paths(self) -> list[str] | None:

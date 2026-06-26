@@ -143,9 +143,9 @@ def verify_export(
                 continue
 
             if part_mode == "separate":
-                if suffix == "A声部":
+                if suffix == "PartA":
                     expected = filter_notes(song.notes, "A")
-                elif suffix == "B声部":
+                elif suffix == "PartB":
                     expected = filter_notes(song.notes, "B")
                 elif suffix == "Other":
                     expected = filter_notes(song.notes, "O")

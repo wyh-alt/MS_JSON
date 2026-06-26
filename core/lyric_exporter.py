@@ -11,7 +11,7 @@ from core.parser import (
     SongData,
     _contains_cjk,
     apply_song_time_offset,
-    format_section_display_name,
+    format_section_chinese_name,
     load_song_json,
     resolve_artist,
     resolve_title,
@@ -40,6 +40,13 @@ META_LANG_LABELS: list[tuple[str, str]] = [
     ("韩文", "ko"),
     ("英文", "en"),
 ]
+
+LYRIC_FIELD_FILENAME_LABELS: dict[str, str] = {
+    "ori": "原歌词",
+    "ko": "韩文歌词",
+    "rom": "罗马音歌词",
+    "en": "英文歌词",
+}
 
 
 @dataclass
@@ -274,11 +281,13 @@ def _output_extension(lyric_format: LyricFormat) -> str:
     return ".txt"
 
 
-def _output_basename(song: SongData, lyric_format: LyricFormat, title_lang: str) -> str:
-    title = _sanitize_filename(resolve_title(song, title_lang))
-    if lyric_format == "txt":
-        return f"{title}_{song.mr_id}-分句"
-    return f"{title}_{song.mr_id}-歌词"
+def _output_basename(song: SongData, lyric_field: str, part: LyricPart) -> str:
+    label = LYRIC_FIELD_FILENAME_LABELS.get(lyric_field, "原歌词")
+    if part == "A":
+        return f"{song.mr_id}-{label}-PartA"
+    if part == "B":
+        return f"{song.mr_id}-{label}-PartB"
+    return f"{song.mr_id}-{label}"
 
 
 def _prepare_lyric_song(
@@ -303,6 +312,7 @@ def export_song_lyrics(
     *,
     lyric_format: LyricFormat,
     part: LyricPart,
+    lyric_field: str,
     title_lang: str,
     artist_lang: str,
     ksc_options: KscOptions | None = None,
@@ -332,7 +342,7 @@ def export_song_lyrics(
         artist_lang=artist_lang,
         ksc_options=ksc_options,
     )
-    filename = f"{_output_basename(song, lyric_format, title_lang)}{_output_extension(lyric_format)}"
+    filename = f"{_output_basename(song, lyric_field, part)}{_output_extension(lyric_format)}"
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, filename)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -341,7 +351,7 @@ def export_song_lyrics(
 
 
 SECTION_EXPORT_HEADERS = (
-    "伴奏ID",
+    "MSID",
     "歌名",
     "歌手",
     "段落类型",
@@ -401,7 +411,7 @@ def collect_section_export_rows(
                 str(song.mr_id),
                 title,
                 artist,
-                format_section_display_name(info.name),
+                format_section_chinese_name(info.name),
                 _format_section_time(start_ms),
                 _format_section_time(end_ms),
                 info.first_line_text,
@@ -434,8 +444,21 @@ def write_sections_excel(
     for cell in sheet[1]:
         cell.font = Font(bold=True)
 
+    time_column_indexes = [
+        index + 1
+        for index, header in enumerate(SECTION_EXPORT_HEADERS)
+        if header in ("起始时间", "结束时间")
+    ]
+
     for row in rows:
         sheet.append(list(row))
+
+    for row_index in range(2, sheet.max_row + 1):
+        for column_index in time_column_indexes:
+            cell = sheet.cell(row=row_index, column=column_index)
+            if cell.value is not None:
+                cell.value = str(cell.value)
+            cell.number_format = "@"
 
     for column_cells in sheet.columns:
         max_length = 0

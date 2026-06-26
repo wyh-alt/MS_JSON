@@ -492,6 +492,35 @@ def format_section_display_name(name: str) -> str:
     return name[0].upper() + name[1:]
 
 
+_SECTION_NAME_ZH_RE = re.compile(
+    r"^(intro|verse|chorus|bridge|rap|interlude|outro)(\d*)$",
+    re.IGNORECASE,
+)
+_SECTION_BASE_ZH = {
+    "intro": "前奏",
+    "verse": "主歌",
+    "chorus": "副歌",
+    "bridge": "桥段",
+    "rap": "说唱",
+    "interlude": "间奏",
+    "outro": "尾奏",
+}
+
+
+def format_section_chinese_name(name: str) -> str:
+    """将段落英文名（如 verse1、chorus2）译为中文展示名。"""
+    name = name.strip()
+    if not name:
+        return "段落"
+    match = _SECTION_NAME_ZH_RE.match(name)
+    if not match:
+        return format_section_display_name(name)
+    base = match.group(1).lower()
+    number = match.group(2)
+    label = _SECTION_BASE_ZH.get(base, format_section_display_name(name))
+    return f"{label}{number}" if number else label
+
+
 def _parse_section_line(line: dict, lyric_field: str) -> LyricLine | None:
     syllables: list[LyricWord] = []
     for word in line.get("word", []):

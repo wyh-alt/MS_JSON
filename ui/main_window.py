@@ -398,8 +398,8 @@ class MainWindow(FluentWindow):
         super().__init__()
         self.navigationInterface.setReturnButtonVisible(False)
         self.setWindowTitle("MS JSON 导出工具")
-        self.resize(1000, 640)
-        self.setMinimumSize(1000, 640)
+        self.resize(1000, 700)
+        self.setMinimumSize(1000, 700)
 
         icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icon.ico")
         if os.path.exists(icon_path):

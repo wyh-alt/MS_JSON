@@ -12,10 +12,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Building MS_json.exe ...
+echo Building MS_json (onedir) ...
 python -m PyInstaller MS_json.spec --noconfirm --clean
 if errorlevel 1 exit /b 1
 
 echo.
-echo Done: dist\MS_json.exe
+echo Done: dist\MS_json\MS_json.exe
 pause

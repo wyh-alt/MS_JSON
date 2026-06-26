@@ -143,6 +143,7 @@ class LyricExportWorker(QThread):
                     self.output_dir,
                     lyric_format=self.lyric_format,
                     part=self.part,
+                    lyric_field=self.lyric_field,
                     title_lang=self.title_lang,
                     artist_lang=self.artist_lang,
                     ksc_options=self.ksc_options,

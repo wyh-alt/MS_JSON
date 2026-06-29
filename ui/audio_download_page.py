@@ -189,6 +189,7 @@ class AudioDownloadPage(ScrollArea):
         loudness_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.loudness_checkbox = CheckBox("响度处理", output_option_card)
         self.loudness_checkbox.setFixedHeight(COMPACT_CONTROL_HEIGHT)
+        self.loudness_checkbox.setChecked(True)
         loudness_row.addWidget(self.loudness_checkbox)
         self.loudness_spin = create_signed_value_input(
             output_option_card,
@@ -206,6 +207,7 @@ class AudioDownloadPage(ScrollArea):
         limiter_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.limiter_checkbox = CheckBox("限幅处理", output_option_card)
         self.limiter_checkbox.setFixedHeight(COMPACT_CONTROL_HEIGHT)
+        self.limiter_checkbox.setChecked(True)
         limiter_row.addWidget(self.limiter_checkbox)
         self.limiter_spin = create_signed_value_input(
             output_option_card,

@@ -22,6 +22,7 @@ env/
 # PyInstaller
 build/
 dist/
+_splash_build.png
 *.manifest
 *.spec.bak
 

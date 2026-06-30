@@ -1,7 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import importlib.util
+import os
 import shutil
-from pathlib import Path
 
+from PyInstaller.building.splash import Splash
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
@@ -39,16 +41,40 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+_splash_builder_path = os.path.join(SPECPATH, "scripts", "build_splash_image.py")
+_builder_spec = importlib.util.spec_from_file_location("build_splash_image", _splash_builder_path)
+_builder = importlib.util.module_from_spec(_builder_spec)
+_builder_spec.loader.exec_module(_builder)
+_splash_image_path = os.path.join(SPECPATH, "_splash_build.png")
+_builder.write_boot_splash_image(_splash_image_path)
+
+splash = Splash(
+    _splash_image_path,
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(12, 142),
+    text_size=-9,
+    text_color="#909090",
+    text_default="",
+    always_on_top=True,
+    max_img_size=(360, 148),
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
+    splash.binaries,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="MS_json",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -56,14 +82,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon="icon.ico",
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="MS_json",
 )

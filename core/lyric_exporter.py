@@ -357,8 +357,7 @@ SECTION_EXPORT_HEADERS = (
     "段落类型",
     "起始时间",
     "结束时间",
-    "首句歌词",
-    "末句歌词",
+    "歌词内容",
 )
 
 
@@ -389,7 +388,7 @@ def collect_section_export_rows(
     artist_lang: str,
     time_offset_ms: int = 0,
     audio_reference_calibration: bool = True,
-) -> list[tuple[str, str, str, str, str, str, str, str]]:
+) -> list[tuple[str, str, str, str, str, str, str]]:
     from core.audio_calibration import resolve_export_time_offset
 
     total_offset_ms, _, _ = resolve_export_time_offset(
@@ -399,7 +398,7 @@ def collect_section_export_rows(
     )
     title = resolve_title(song, title_lang)
     artist = resolve_artist(song, artist_lang) or ""
-    rows: list[tuple[str, str, str, str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     for info in song.section_export_infos:
         start_ms, end_ms = _section_export_times(
             info.section_start_ms,
@@ -414,20 +413,19 @@ def collect_section_export_rows(
                 format_section_chinese_name(info.name),
                 _format_section_time(start_ms),
                 _format_section_time(end_ms),
-                info.first_line_text,
-                info.last_line_text,
+                info.lyric_content,
             )
         )
     return rows
 
 
 def write_sections_excel(
-    rows: list[tuple[str, str, str, str, str, str, str, str]],
+    rows: list[tuple[str, str, str, str, str, str, str]],
     output_dir: str,
 ) -> str:
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font
+        from openpyxl.styles import Alignment, Font
     except ImportError as exc:
         raise RuntimeError("缺少 openpyxl 依赖，请先安装：pip install openpyxl") from exc
 
@@ -449,6 +447,7 @@ def write_sections_excel(
         for index, header in enumerate(SECTION_EXPORT_HEADERS)
         if header in ("起始时间", "结束时间")
     ]
+    lyric_column_index = SECTION_EXPORT_HEADERS.index("歌词内容") + 1
 
     for row in rows:
         sheet.append(list(row))
@@ -459,6 +458,8 @@ def write_sections_excel(
             if cell.value is not None:
                 cell.value = str(cell.value)
             cell.number_format = "@"
+        lyric_cell = sheet.cell(row=row_index, column=lyric_column_index)
+        lyric_cell.alignment = Alignment(wrap_text=True, vertical="top")
 
     for column_cells in sheet.columns:
         max_length = 0
@@ -466,7 +467,10 @@ def write_sections_excel(
         for cell in column_cells:
             value = "" if cell.value is None else str(cell.value)
             max_length = max(max_length, len(value))
-        sheet.column_dimensions[column_letter].width = min(max(max_length + 2, 10), 48)
+        sheet.column_dimensions[column_letter].width = min(
+            max(max_length + 2, 10),
+            80 if column_cells[0].value == "歌词内容" else 48,
+        )
 
     workbook.save(output_path)
     return output_path
@@ -481,7 +485,7 @@ def export_sections_excel(
     artist_lang: str,
     time_offset_ms: int = 0,
 ) -> str:
-    all_rows: list[tuple[str, str, str, str, str, str, str, str]] = []
+    all_rows: list[tuple[str, str, str, str, str, str, str]] = []
     for path in json_paths:
         song = load_song_json(path, lyric_field)
         all_rows.extend(

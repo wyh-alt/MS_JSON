@@ -92,8 +92,7 @@ class SectionExportInfo:
     seq: int
     section_start_ms: int
     section_end_ms: int
-    first_line_text: str
-    last_line_text: str
+    lyric_content: str
 
 
 @dataclass
@@ -563,16 +562,14 @@ def extract_section_export_infos(
             if parsed is not None:
                 parsed_lines.append(parsed)
 
-        first_line_text = parsed_lines[0].text if parsed_lines else ""
-        last_line_text = parsed_lines[-1].text if parsed_lines else ""
+        lyric_content = "\n".join(line.text for line in parsed_lines)
         infos.append(
             SectionExportInfo(
                 name=name,
                 seq=int(section.get("seq", 0)),
                 section_start_ms=section_start_ms,
                 section_end_ms=section_end_ms,
-                first_line_text=first_line_text,
-                last_line_text=last_line_text,
+                lyric_content=lyric_content,
             )
         )
     infos.sort(key=lambda item: (item.seq, item.section_start_ms))
@@ -956,8 +953,7 @@ def _shift_section_export_info(info: SectionExportInfo, offset_ms: int) -> Secti
         seq=info.seq,
         section_start_ms=section_start_ms,
         section_end_ms=section_end_ms,
-        first_line_text=info.first_line_text,
-        last_line_text=info.last_line_text,
+        lyric_content=info.lyric_content,
     )
 
 

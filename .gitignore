@@ -45,3 +45,6 @@ MS JSON/
 *.log
 *.tmp
 *.bak
+
+# Runtime audio cache
+.ms_json_audio_cache/

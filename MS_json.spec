@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import importlib.util
 import os
-import shutil
 
 from PyInstaller.building.splash import Splash
 from PyInstaller.utils.hooks import collect_all
@@ -18,9 +17,34 @@ for package in ("qfluentwidgets", "PyQt6", "librosa", "numpy", "scipy", "soundfi
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
 
-ffmpeg_path = shutil.which("ffmpeg")
-if not ffmpeg_path:
+def _find_real_ffmpeg() -> str:
+    """在 PATH 中查找可独立运行的 ffmpeg.exe。
+
+    跳过 Chocolatey 的代理 shim（如 C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe）：
+    该 shim 体积很小，内部通过相对路径指向 chocolatey\\lib 下的真实文件，一旦被
+    打包进单文件 exe 并在运行时解压到临时目录，就找不到目标程序，导致 ffmpeg
+    调用直接失败（退出码 4294967295，无任何错误输出）。
+    """
+    candidates = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = directory.strip('"')
+        if not directory:
+            continue
+        candidate = os.path.join(directory, "ffmpeg.exe")
+        if os.path.isfile(candidate):
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        if "chocolatey" not in candidate.lower():
+            return candidate
+    if candidates:
+        print(f"警告：仅找到 Chocolatey 的 ffmpeg 代理程序 {candidates[0]}，"
+              "该文件打包后可能无法运行，建议安装独立版 ffmpeg 并调整 PATH 顺序。")
+        return candidates[0]
     raise SystemExit("构建失败：未找到 ffmpeg，请先安装 ffmpeg 并确保命令行可用。")
+
+
+ffmpeg_path = _find_real_ffmpeg()
 binaries.append((ffmpeg_path, "."))
 
 a = Analysis(

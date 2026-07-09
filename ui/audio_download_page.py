@@ -199,6 +199,18 @@ class AudioDownloadPage(ScrollArea):
             suffix="LUFS",
         )
         loudness_row.addWidget(self.loudness_spin)
+        self.track_gain_checkbox = CheckBox("分轨电平", output_option_card)
+        self.track_gain_checkbox.setFixedHeight(COMPACT_CONTROL_HEIGHT)
+        self.track_gain_checkbox.setChecked(True)
+        loudness_row.addWidget(self.track_gain_checkbox)
+        self.track_gain_spin = create_signed_value_input(
+            output_option_card,
+            minimum=-60,
+            maximum=10,
+            value=-6,
+            suffix="dB",
+        )
+        loudness_row.addWidget(self.track_gain_spin)
         loudness_row.addStretch(1)
         output_option_layout.addLayout(loudness_row)
 
@@ -251,15 +263,30 @@ class AudioDownloadPage(ScrollArea):
         self.m4a_codec_combo.currentIndexChanged.connect(self._update_format_options)
         self.loudness_checkbox.toggled.connect(self._update_loudness_controls)
         self.limiter_checkbox.toggled.connect(self._update_limiter_controls)
+        self.content_combo.currentIndexChanged.connect(self._update_track_gain_visibility)
+        self.track_gain_checkbox.toggled.connect(self._update_track_gain_controls)
         self._update_format_options()
         self._update_loudness_controls()
         self._update_limiter_controls()
+        self._update_track_gain_visibility()
+        self._update_track_gain_controls()
 
     def _update_loudness_controls(self):
         self.loudness_spin.setEnabled(self.loudness_checkbox.isChecked())
 
     def _update_limiter_controls(self):
         self.limiter_spin.setEnabled(self.limiter_checkbox.isChecked())
+
+    def _current_content(self) -> str:
+        return AUDIO_CONTENT_LABELS[self.content_combo.currentIndex()][1]
+
+    def _update_track_gain_visibility(self):
+        is_merge = self._current_content() in ("merge_har_drum", "merge_har_drum_mel")
+        self.track_gain_checkbox.setVisible(is_merge)
+        self.track_gain_spin.setVisible(is_merge)
+
+    def _update_track_gain_controls(self):
+        self.track_gain_spin.setEnabled(self.track_gain_checkbox.isChecked())
 
     def _current_output_format(self) -> str:
         return OUTPUT_FORMAT_LABELS[self.format_combo.currentIndex()][1]
@@ -326,6 +353,8 @@ class AudioDownloadPage(ScrollArea):
             loudness_lufs=float(self.loudness_spin.value()),
             limiter_enabled=self.limiter_checkbox.isChecked(),
             limiter_db=float(self.limiter_spin.value()),
+            track_gain_enabled=self.track_gain_checkbox.isChecked(),
+            track_gain_db=float(self.track_gain_spin.value()),
         )
 
     def _validate_paths(self) -> list[str] | None:

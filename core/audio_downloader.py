@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -14,6 +15,12 @@ from pathlib import Path
 from typing import Literal
 
 from core.parser import SongData
+
+# Windows 下调用 ffmpeg 时抑制一闪而过的控制台窗口
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+# 第一遍只用来测量，LRA 取多少都不影响 measured_* 结果
+_MEASURE_LRA = 11.0
 
 AudioContent = Literal[
     "merge_har_drum",
@@ -117,6 +124,8 @@ class AudioDownloadOptions:
     loudness_lufs: float = -12.0
     limiter_enabled: bool = False
     limiter_db: float = -1.0
+    track_gain_enabled: bool = True
+    track_gain_db: float = -6.0
 
 
 def resolve_key_suffix(key_mode: KeyMode, original_key: str) -> str:
@@ -273,18 +282,47 @@ def _pcm_codec(bit_depth: int) -> str:
     return "pcm_s16le" if bit_depth == 16 else "pcm_s24le"
 
 
-def _postprocess_filter_chain(options: AudioDownloadOptions) -> list[str]:
-    chain: list[str] = []
-    limit_db: float | None = None
-    if options.limiter_enabled:
-        limit_db = options.limiter_db if options.limiter_db < 0 else -abs(options.limiter_db)
-    if options.loudness_enabled:
-        target_lufs = options.loudness_lufs if options.loudness_lufs < 0 else -abs(options.loudness_lufs)
-        true_peak = limit_db if limit_db is not None else -1.5
-        chain.append(f"loudnorm=I={target_lufs}:LRA=11:TP={true_peak}")
-    if limit_db is not None:
-        chain.append(f"alimiter=limit={limit_db}dB:attack=5:release=50:level=disabled")
-    return chain
+@dataclass(frozen=True)
+class LoudnessMeasurement:
+    input_i: str
+    input_lra: str
+    input_tp: str
+    input_thresh: str
+    target_offset: str
+
+
+def _normalize_negative(value: float) -> float:
+    return value if value < 0 else -abs(value)
+
+
+def _resolve_loudness_params(options: AudioDownloadOptions) -> tuple[float | None, float | None]:
+    """返回 (loudness_lufs, limiter_db)，未启用者为 None。"""
+    limit_db = _normalize_negative(options.limiter_db) if options.limiter_enabled else None
+    target_lufs = _normalize_negative(options.loudness_lufs) if options.loudness_enabled else None
+    return target_lufs, limit_db
+
+
+def _resolve_track_gain_db(options: AudioDownloadOptions) -> float | None:
+    """仅在合并伴奏且勾选分轨电平时返回增益值，其他场景为 None。"""
+    if not options.track_gain_enabled:
+        return None
+    return float(options.track_gain_db)
+
+
+def _build_amix_expr(count: int, track_gain_db: float | None = None) -> str:
+    if track_gain_db is not None:
+        pre = "".join(
+            f"[{i}:a]volume={track_gain_db}dB[t{i}];" for i in range(count)
+        )
+        filter_inputs = "".join(f"[t{i}]" for i in range(count))
+    else:
+        pre = ""
+        filter_inputs = "".join(f"[{i}:a]" for i in range(count))
+    return (
+        f"{pre}"
+        f"{filter_inputs}amix=inputs={count}"
+        f":duration=longest:dropout_transition=0:normalize=0"
+    )
 
 
 def _build_ffmpeg_output_args(options: AudioDownloadOptions) -> list[str]:
@@ -308,27 +346,131 @@ def _build_ffmpeg_output_args(options: AudioDownloadOptions) -> list[str]:
     return args
 
 
-def _run_ffmpeg(args: list[str]) -> None:
+def _invoke_ffmpeg(args: list[str], *, quiet: bool = True) -> subprocess.CompletedProcess:
     ffmpeg = find_ffmpeg_executable()
     if ffmpeg is None:
         raise RuntimeError("未找到 ffmpeg，请安装 ffmpeg 或将其放入程序目录")
 
+    loglevel = "error" if quiet else "info"
     try:
-        subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", *args],
+        return subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", loglevel, *args],
             check=True,
             capture_output=True,
+            creationflags=_CREATE_NO_WINDOW,
         )
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"ffmpeg 处理失败: {stderr or exc}") from exc
 
 
+def _run_ffmpeg(args: list[str]) -> None:
+    _invoke_ffmpeg(args, quiet=True)
+
+
+def _parse_loudness_json(stderr_text: str) -> LoudnessMeasurement:
+    start = stderr_text.rfind("{")
+    end = stderr_text.rfind("}")
+    if start < 0 or end < 0 or end < start:
+        tail = stderr_text[-500:]
+        raise RuntimeError(f"loudnorm 分析未返回 JSON 结果: {tail}")
+    try:
+        stats = json.loads(stderr_text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"loudnorm JSON 解析失败: {exc}") from exc
+    try:
+        return LoudnessMeasurement(
+            input_i=stats["input_i"],
+            input_lra=stats["input_lra"],
+            input_tp=stats["input_tp"],
+            input_thresh=stats["input_thresh"],
+            target_offset=stats["target_offset"],
+        )
+    except KeyError as exc:
+        raise RuntimeError(f"loudnorm 输出缺少字段: {exc}") from exc
+
+
+def _measure_loudness(
+    sources: list[Path],
+    target_lufs: float,
+    true_peak: float,
+    track_gain_db: float | None = None,
+) -> LoudnessMeasurement:
+    """第一遍：跑 loudnorm 分析拿到 measured_* 参数（分轨电平提前应用）。"""
+    input_args: list[str] = []
+    for source in sources:
+        input_args.extend(["-i", str(source)])
+
+    loudnorm_expr = (
+        f"loudnorm=I={target_lufs}:LRA={_MEASURE_LRA}:TP={true_peak}"
+        f":print_format=json"
+    )
+
+    if len(sources) == 1:
+        args = [
+            "-y",
+            *input_args,
+            "-af",
+            loudnorm_expr,
+            "-f",
+            "null",
+            "-",
+        ]
+    else:
+        filter_complex = (
+            f"{_build_amix_expr(len(sources), track_gain_db)}[mix];"
+            f"[mix]{loudnorm_expr}[out]"
+        )
+        args = [
+            "-y",
+            *input_args,
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[out]",
+            "-f",
+            "null",
+            "-",
+        ]
+
+    result = _invoke_ffmpeg(args, quiet=False)
+    stderr_text = result.stderr.decode("utf-8", errors="replace")
+    return _parse_loudness_json(stderr_text)
+
+
+def _build_export_filters(
+    options: AudioDownloadOptions,
+    sources: list[Path],
+    track_gain_db: float | None = None,
+) -> list[str]:
+    """构造导出用的后处理链：loudnorm 走两遍线性模式，尾部再挂 alimiter。"""
+    target_lufs, limit_db = _resolve_loudness_params(options)
+    chain: list[str] = []
+
+    if target_lufs is not None:
+        true_peak = limit_db if limit_db is not None else -1.5
+        measurement = _measure_loudness(sources, target_lufs, true_peak, track_gain_db)
+        # 第二遍：拿 measured_i 手工算增益，纯线性 volume 偏移；
+        # 不用 loudnorm 的 linear 模式——它自带的前瞻真峰限幅会在峰值触顶时压掉大动态段，
+        # 而且 LRA/TP 条件不满足时还会静默回退成动态压缩。
+        try:
+            input_i = float(measurement.input_i)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"loudnorm 未返回可用的 input_i: {measurement.input_i}") from exc
+        gain_db = target_lufs - input_i
+        chain.append(f"volume={gain_db:.2f}dB")
+
+    if limit_db is not None:
+        chain.append(f"alimiter=limit={limit_db}dB:attack=5:release=50:level=disabled")
+
+    return chain
+
+
 def _export_single_source(source: Path, output_path: Path, options: AudioDownloadOptions) -> None:
+    filters = _build_export_filters(options, [source])
     args = ["-y", "-i", str(source)]
-    post_filters = _postprocess_filter_chain(options)
-    if post_filters:
-        args.extend(["-af", ",".join(post_filters)])
+    if filters:
+        args.extend(["-af", ",".join(filters)])
     args.extend([*_build_ffmpeg_output_args(options), str(output_path)])
     _run_ffmpeg(args)
 
@@ -338,14 +480,11 @@ def _mix_and_export(sources: list[Path], output_path: Path, options: AudioDownlo
     for source in sources:
         input_args.extend(["-i", str(source)])
 
-    filter_inputs = "".join(f"[{index}:a]" for index in range(len(sources)))
-    segments = [
-        f"{filter_inputs}amix=inputs={len(sources)}"
-        f":duration=longest:dropout_transition=0:normalize=0[a0]"
-    ]
+    track_gain_db = _resolve_track_gain_db(options)
+    filters = _build_export_filters(options, sources, track_gain_db)
+    segments = [f"{_build_amix_expr(len(sources), track_gain_db)}[a0]"]
     output_label = "[a0]"
-    post_filters = _postprocess_filter_chain(options)
-    for index, post_filter in enumerate(post_filters):
+    for index, post_filter in enumerate(filters):
         next_label = f"[p{index}]"
         segments.append(f"{output_label}{post_filter}{next_label}")
         output_label = next_label

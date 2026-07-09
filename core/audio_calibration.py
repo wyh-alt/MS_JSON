@@ -11,6 +11,7 @@ import numpy as np
 
 from core.parser import SongData
 from core.audio_downloader import (
+    _CREATE_NO_WINDOW,
     find_ffmpeg_executable,
     resolve_audio_file,
     resolve_mr_mel_url,
@@ -320,6 +321,7 @@ def _ensure_pcm_wav(audio_path: Path) -> Path:
             ],
             check=True,
             capture_output=True,
+            creationflags=_CREATE_NO_WINDOW,
         )
         os.replace(temp_path, wav_cache)
     except subprocess.CalledProcessError as exc:

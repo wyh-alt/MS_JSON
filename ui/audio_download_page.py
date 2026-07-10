@@ -226,7 +226,7 @@ class AudioDownloadPage(ScrollArea):
             minimum=-24,
             maximum=-1,
             value=-1,
-            suffix="dB",
+            suffix="dBTP",
         )
         limiter_row.addWidget(self.limiter_spin)
         limiter_row.addStretch(1)

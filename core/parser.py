@@ -1008,7 +1008,7 @@ def apply_song_time_offset(song: SongData, offset_ms: int) -> SongData:
 
 
 def is_valid_ms_json(data: dict[str, Any]) -> bool:
-    mnote = data.get("mnote")
+    mnote = data.get("mnote") or data.get("msi_melody_note")
     if not isinstance(mnote, dict):
         return False
     return isinstance(mnote.get("note"), list) and isinstance(mnote.get("section"), list)
@@ -1021,7 +1021,7 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
     if not is_valid_ms_json(data):
         raise ValueError(f"不是有效的 MS JSON 文件: {path}")
 
-    mnote = data["mnote"]
+    mnote = data.get("mnote") or data.get("msi_melody_note", {})
     sections = mnote.get("section", [])
 
     return SongData(

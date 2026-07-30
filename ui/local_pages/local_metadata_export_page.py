@@ -41,6 +41,7 @@ class LocalMetadataResult:
     success_count: int = 0
     failed: list[tuple[str, str]] | None = None
     resource_errors: list[str] | None = None
+    cache_hits: list[str] | None = None
     error: str | None = None
 
 
@@ -48,23 +49,32 @@ class LocalMetadataWorker(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object)
 
-    def __init__(self, bundles: list[LocalSongBundle], output_dir: str, parent=None):
+    def __init__(self, parent_dir: str, output_dir: str, parent=None):
         super().__init__(parent)
-        self.bundles = bundles
+        self.parent_dir = parent_dir
         self.output_dir = output_dir
 
     def run(self):
+        from core.parser import is_valid_ms_json as _is_valid
+        self.progress.emit(0, "正在扫描母文件夹…")
         try:
-            from pathlib import Path
+            bundles = scan_local_parent_dir(self.parent_dir)
+        except ValueError as exc:
+            self.finished.emit(LocalMetadataResult(error=str(exc)))
+            return
 
-            output_path = Path(self.output_dir)
+        try:
+            from pathlib import Path as _Path
+
+            output_path = _Path(self.output_dir)
             rows: list[list[str]] = []
             all_resource_errors: list[str] = []
+            all_cache_hits: list[str] = []
             failed: list[tuple[str, str]] = []
 
-            for index, bundle in enumerate(self.bundles, start=1):
+            for index, bundle in enumerate(bundles, start=1):
                 name = os.path.basename(bundle.json_path)
-                self.progress.emit(int(index / len(self.bundles) * 100), f"正在处理: {name}")
+                self.progress.emit(int(index / len(bundles) * 100), f"正在处理: {name}")
                 try:
                     with open(bundle.json_path, "r", encoding="utf-8") as f:
                         raw = json.load(f)
@@ -86,6 +96,8 @@ class LocalMetadataWorker(QThread):
                     rows.append(values)
                     for error in row.download_errors:
                         all_resource_errors.append(f"{name} ({song.mr_id}): {error}")
+                    for msg in row.cache_hits:
+                        all_cache_hits.append(f"{name} ({song.mr_id}): {msg}")
                 except Exception as exc:
                     failed.append((bundle.json_path, str(exc)))
 
@@ -99,6 +111,7 @@ class LocalMetadataWorker(QThread):
                     success_count=len(rows),
                     failed=failed,
                     resource_errors=all_resource_errors,
+                    cache_hits=all_cache_hits,
                 )
             )
         except Exception as exc:
@@ -183,33 +196,28 @@ class LocalMetadataExportPage(ScrollArea):
         if folder:
             self.output_edit.setText(folder)
 
-    def _scan_bundles(self) -> list[LocalSongBundle] | None:
+    def _validate_inputs(self) -> tuple[str, str] | None:
         parent_dir = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-        if not parent_dir or not os.path.exists(parent_dir):
+        if not parent_dir or not os.path.isdir(parent_dir):
             InfoBar.warning("路径无效", "请输入或拖入有效的母文件夹路径。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
         if not output_dir:
             InfoBar.warning("缺少输出目录", "请选择元数据与资源的输出目录。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-        try:
-            bundles = scan_local_parent_dir(parent_dir)
-        except ValueError as exc:
-            InfoBar.warning("未找到有效资源", str(exc), duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
-            return None
-        return bundles
+        return parent_dir, output_dir
 
     def _start_export(self):
-        bundles = self._scan_bundles()
-        if bundles is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-        output_dir = self.output_edit.text().strip()
+        parent_dir, output_dir = paths
 
         self.export_btn.setEnabled(False)
-        self.progress_panel.start(f"共 {len(bundles)} 个 MSID，准备提取…")
-        InfoBar.info("开始提取", f"共 {len(bundles)} 个 MSID，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+        self.progress_panel.start("正在扫描母文件夹…")
+        InfoBar.info("开始提取", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
-        self.worker = LocalMetadataWorker(bundles, output_dir)
+        self.worker = LocalMetadataWorker(parent_dir, output_dir)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
@@ -226,17 +234,20 @@ class LocalMetadataExportPage(ScrollArea):
 
         failed = result.failed or []
         resource_errors = result.resource_errors or []
-        if not failed and not resource_errors:
+        cache_hits = result.cache_hits or []
+        if not failed and not resource_errors and not cache_hits:
             InfoBar.success("提取完成", f"已导出 {result.success_count} 首曲目元数据。\n{result.excel_path}", duration=6000, parent=self.window(), position=InfoBarPosition.TOP)
             return
 
         lines = [f"成功: {result.success_count} 首", f"Excel: {result.excel_path}"]
+        if cache_hits:
+            lines.append(cache_hits[0])
         if resource_errors:
             lines.append(f"资源问题: {len(resource_errors)} 项")
-            lines.extend(f"- {item}" for item in resource_errors[:8])
+            lines.extend(f"- {item}" for item in resource_errors[:4])
         if failed:
             lines.append(f"失败: {len(failed)} 个")
-            for path, reason in failed[:8]:
+            for path, reason in failed[:4]:
                 dir_name = os.path.basename(os.path.dirname(path))
                 lines.append(f"- {dir_name}/{os.path.basename(path)}: {reason}")
         box = MessageBox("提取结果", "\n".join(lines), self.window())

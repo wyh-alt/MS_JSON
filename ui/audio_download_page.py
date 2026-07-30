@@ -51,21 +51,29 @@ class AudioDownloadWorker(QThread):
 
     def __init__(
         self,
-        json_paths: list[str],
+        input_path: str,
         output_dir: str,
         options: AudioDownloadOptions,
         parent=None,
     ):
         super().__init__(parent)
-        self.json_paths = json_paths
+        self.input_path = input_path
         self.output_dir = output_dir
         self.options = options
 
     def run(self):
-        result = AudioDownloadResult(success=[], failed=[])
-        total = len(self.json_paths)
+        from core.parser import collect_json_files
 
-        for index, path in enumerate(self.json_paths, start=1):
+        self.progress.emit(0, "正在扫描 JSON 文件…")
+        json_paths = collect_json_files(self.input_path, valid_only=True)
+
+        result = AudioDownloadResult(success=[], failed=[])
+        if not json_paths:
+            self.finished.emit(result)
+            return
+
+        total = len(json_paths)
+        for index, path in enumerate(json_paths, start=1):
             name = os.path.basename(path)
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
             try:
@@ -357,63 +365,30 @@ class AudioDownloadPage(ScrollArea):
             track_gain_db=float(self.track_gain_spin.value()),
         )
 
-    def _validate_paths(self) -> list[str] | None:
+    def _validate_inputs(self) -> tuple[str, str] | None:
         input_path = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-
         if not input_path or not os.path.exists(input_path):
-            InfoBar.warning(
-                "路径无效",
-                "请输入或拖入有效的 JSON 文件/文件夹路径。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+            InfoBar.warning("路径无效", "请输入或拖入有效的 JSON 文件/文件夹路径。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-
-        json_paths = collect_json_files(input_path, valid_only=True)
-        if not json_paths:
-            InfoBar.warning(
-                "未找到有效 JSON",
-                "路径下没有包含 mnote 数据的有效 JSON 文件。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
-            return None
-
         if not output_dir:
-            InfoBar.warning(
-                "缺少输出目录",
-                "请选择音频文件的输出目录。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+            InfoBar.warning("缺少输出目录", "请选择音频文件的输出目录。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-
-        return json_paths
+        return input_path, output_dir
 
     def _start_export(self):
-        json_paths = self._validate_paths()
-        if json_paths is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-
-        output_dir = self.output_edit.text().strip()
+        input_path, output_dir = paths
         options = self._build_options()
 
         self.export_btn.setEnabled(False)
-        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备下载…")
-        InfoBar.info(
-            "开始下载",
-            f"共 {len(json_paths)} 个 JSON，请稍候…",
-            duration=2000,
-            parent=self.window(),
-            position=InfoBarPosition.TOP,
-        )
+        self.progress_panel.start("正在扫描 JSON 文件…")
+        InfoBar.info("开始导出", "正在扫描 JSON 文件，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
         self.worker = AudioDownloadWorker(
-            json_paths=json_paths,
+            input_path=input_path,
             output_dir=output_dir,
             options=options,
         )
@@ -427,6 +402,10 @@ class AudioDownloadPage(ScrollArea):
     def _on_finished(self, result: AudioDownloadResult):
         self.export_btn.setEnabled(True)
         self.progress_panel.finish()
+
+        if not result.success and not result.failed:
+            InfoBar.warning("未找到有效 JSON", "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
+            return
 
         if result.success and not result.failed:
             InfoBar.success(

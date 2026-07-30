@@ -47,11 +47,11 @@ class LocalMidiWorker(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object)
 
-    def __init__(self, bundles, output_dir, part_mode, lyric_field, write_tempo, write_lyrics,
+    def __init__(self, parent_dir, output_dir, part_mode, lyric_field, write_tempo, write_lyrics,
                  lyric_granularity, lower_octave, write_section_markers, exclude_rap_sections,
                  remove_non_melody_notes, time_offset_ms, audio_reference_calibration, parent=None):
         super().__init__(parent)
-        self.bundles = bundles
+        self.parent_dir = parent_dir
         self.output_dir = output_dir
         self.part_mode = part_mode
         self.lyric_field = lyric_field
@@ -66,9 +66,15 @@ class LocalMidiWorker(QThread):
         self.audio_reference_calibration = audio_reference_calibration
 
     def run(self):
+        self.progress.emit(0, "正在扫描母文件夹…")
+        try:
+            bundles = scan_local_parent_dir(self.parent_dir)
+        except ValueError as exc:
+            self.finished.emit(LocalMidiResult(success=[], failed=[(self.parent_dir, str(exc))], skipped=0, calibration_notes=[]))
+            return
         result = LocalMidiResult(success=[], failed=[], skipped=0, calibration_notes=[])
-        total = len(self.bundles)
-        for index, bundle in enumerate(self.bundles, start=1):
+        total = len(bundles)
+        for index, bundle in enumerate(bundles, start=1):
             name = os.path.basename(bundle.json_path)
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
             try:
@@ -243,27 +249,22 @@ class LocalMidiExportPage(ScrollArea):
         if folder:
             self.output_edit.setText(folder)
 
-    def _scan_bundles(self) -> list[LocalSongBundle] | None:
+    def _validate_inputs(self) -> tuple[str, str] | None:
         parent_dir = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-        if not parent_dir or not os.path.exists(parent_dir):
+        if not parent_dir or not os.path.isdir(parent_dir):
             InfoBar.warning("路径无效", "请输入或拖入有效的母文件夹路径。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
         if not output_dir:
             InfoBar.warning("缺少输出目录", "请选择 MIDI 文件的输出目录。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-        try:
-            bundles = scan_local_parent_dir(parent_dir)
-        except ValueError as exc:
-            InfoBar.warning("未找到有效资源", str(exc), duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
-            return None
-        return bundles
+        return parent_dir, output_dir
 
     def _start_export(self):
-        bundles = self._scan_bundles()
-        if bundles is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-        output_dir = self.output_edit.text().strip()
+        parent_dir, output_dir = paths
         part_mode = PART_MODE_LABELS[self.part_combo.currentIndex()][1]
         lyric_field = LYRIC_FIELD_OPTIONS[self.lyric_combo.currentIndex()][1]
         write_tempo = self.tempo_checkbox.isChecked()
@@ -277,8 +278,8 @@ class LocalMidiExportPage(ScrollArea):
         audio_calibration = self.audio_calibration_checkbox.isChecked()
 
         self.export_btn.setEnabled(False)
-        self.progress_panel.start(f"共 {len(bundles)} 个 MSID，准备导出…")
-        InfoBar.info("开始导出", f"共 {len(bundles)} 个 MSID，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+        self.progress_panel.start("正在扫描母文件夹…")
+        InfoBar.info("开始导出", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
         self.worker = LocalMidiWorker(
             bundles, output_dir, part_mode, lyric_field, write_tempo, write_lyrics,

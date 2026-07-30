@@ -55,16 +55,23 @@ class LocalAudioWorker(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object)
 
-    def __init__(self, bundles: list[LocalSongBundle], output_dir: str, options: AudioDownloadOptions, parent=None):
+    def __init__(self, parent_dir: str, output_dir: str, options: AudioDownloadOptions, parent=None):
         super().__init__(parent)
-        self.bundles = bundles
+        self.parent_dir = parent_dir
         self.output_dir = output_dir
         self.options = options
 
     def run(self):
+        self.progress.emit(0, "正在扫描母文件夹…")
+        try:
+            bundles = scan_local_parent_dir(self.parent_dir)
+        except ValueError as exc:
+            self.finished.emit(LocalAudioResult(success=[], failed=[(self.parent_dir, str(exc))]))
+            return
+
         result = LocalAudioResult(success=[], failed=[])
-        total = len(self.bundles)
-        for index, bundle in enumerate(self.bundles, start=1):
+        total = len(bundles)
+        for index, bundle in enumerate(bundles, start=1):
             name = os.path.basename(bundle.json_path)
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
             try:
@@ -338,34 +345,29 @@ class LocalAudioDownloadPage(ScrollArea):
             track_gain_db=float(self.track_gain_spin.value()),
         )
 
-    def _scan_bundles(self) -> list[LocalSongBundle] | None:
+    def _validate_inputs(self) -> tuple[str, str] | None:
         parent_dir = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-        if not parent_dir or not os.path.exists(parent_dir):
+        if not parent_dir or not os.path.isdir(parent_dir):
             InfoBar.warning("路径无效", "请输入或拖入有效的母文件夹路径。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
         if not output_dir:
             InfoBar.warning("缺少输出目录", "请选择音频文件的输出目录。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-        try:
-            bundles = scan_local_parent_dir(parent_dir)
-        except ValueError as exc:
-            InfoBar.warning("未找到有效资源", str(exc), duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
-            return None
-        return bundles
+        return parent_dir, output_dir
 
     def _start_export(self):
-        bundles = self._scan_bundles()
-        if bundles is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-        output_dir = self.output_edit.text().strip()
+        parent_dir, output_dir = paths
         options = self._build_options()
 
         self.export_btn.setEnabled(False)
-        self.progress_panel.start(f"共 {len(bundles)} 个 MSID，准备导出…")
-        InfoBar.info("开始导出", f"共 {len(bundles)} 个 MSID，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+        self.progress_panel.start("正在扫描母文件夹…")
+        InfoBar.info("开始导出", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
-        self.worker = LocalAudioWorker(bundles, output_dir, options)
+        self.worker = LocalAudioWorker(parent_dir, output_dir, options)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()

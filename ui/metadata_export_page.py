@@ -28,6 +28,7 @@ class MetadataExportWorkerResult:
     success_count: int = 0
     failed: list[tuple[str, str]] | None = None
     download_errors: list[str] | None = None
+    cache_hits: list[str] | None = None
     error: str | None = None
 
 
@@ -37,23 +38,31 @@ class MetadataExportWorker(QThread):
 
     def __init__(
         self,
-        json_paths: list[str],
+        input_path: str,
         output_dir: str,
         download_resources: bool,
         parent=None,
     ):
         super().__init__(parent)
-        self.json_paths = json_paths
+        self.input_path = input_path
         self.output_dir = output_dir
         self.download_resources = download_resources
 
     def run(self):
+        from core.parser import collect_json_files
+
+        self.progress.emit(0, "正在扫描 JSON 文件…")
         try:
+            json_paths = collect_json_files(self.input_path, valid_only=True)
+            if not json_paths:
+                self.finished.emit(MetadataExportWorkerResult(error="未找到有效 JSON"))
+                return
+
             def on_progress(index: int, total: int, name: str):
                 self.progress.emit(int(index / total * 100), f"正在处理: {name}")
 
             result = export_songs_metadata(
-                self.json_paths,
+                json_paths,
                 self.output_dir,
                 download_resources=self.download_resources,
                 progress_callback=on_progress,
@@ -64,6 +73,7 @@ class MetadataExportWorker(QThread):
                     success_count=result.success_count,
                     failed=result.failed,
                     download_errors=result.download_errors,
+                    cache_hits=result.cache_hits,
                 )
             )
         except Exception as exc:
@@ -166,63 +176,30 @@ class MetadataExportPage(ScrollArea):
         if folder:
             self.output_edit.setText(folder)
 
-    def _validate_paths(self) -> list[str] | None:
+    def _validate_inputs(self) -> tuple[str, str] | None:
         input_path = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-
         if not input_path or not os.path.exists(input_path):
-            InfoBar.warning(
-                "路径无效",
-                "请输入或拖入有效的 JSON 文件/文件夹路径。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+            InfoBar.warning("路径无效", "请输入或拖入有效的 JSON 文件/文件夹路径。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-
-        json_paths = collect_json_files(input_path, valid_only=True)
-        if not json_paths:
-            InfoBar.warning(
-                "未找到有效 JSON",
-                "路径下没有包含 mnote 数据的有效 JSON 文件。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
-            return None
-
         if not output_dir:
-            InfoBar.warning(
-                "缺少输出目录",
-                "请选择元数据与资源的输出目录。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+            InfoBar.warning("缺少输出目录", "请选择元数据与资源的输出目录。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-
-        return json_paths
+        return input_path, output_dir
 
     def _start_export(self):
-        json_paths = self._validate_paths()
-        if json_paths is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-
-        output_dir = self.output_edit.text().strip()
+        input_path, output_dir = paths
         download_resources = self.download_checkbox.isChecked()
 
         self.export_btn.setEnabled(False)
-        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备提取…")
-        InfoBar.info(
-            "开始提取",
-            f"共 {len(json_paths)} 个 JSON，请稍候…",
-            duration=2000,
-            parent=self.window(),
-            position=InfoBarPosition.TOP,
-        )
+        self.progress_panel.start("正在扫描 JSON 文件…")
+        InfoBar.info("开始提取", "正在扫描 JSON 文件，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
         self.worker = MetadataExportWorker(
-            json_paths=json_paths,
+            input_path=input_path,
             output_dir=output_dir,
             download_resources=download_resources,
         )
@@ -249,8 +226,9 @@ class MetadataExportPage(ScrollArea):
 
         failed = result.failed or []
         download_errors = result.download_errors or []
+        cache_hits = result.cache_hits or []
 
-        if not failed and not download_errors:
+        if not failed and not download_errors and not cache_hits:
             InfoBar.success(
                 "提取完成",
                 f"已导出 {result.success_count} 首曲目元数据。\n{result.excel_path}",
@@ -264,12 +242,14 @@ class MetadataExportPage(ScrollArea):
             f"成功: {result.success_count} 首",
             f"Excel: {result.excel_path}",
         ]
+        if cache_hits:
+            lines.append(cache_hits[0])
         if download_errors:
             lines.append(f"资源下载问题: {len(download_errors)} 项")
-            lines.extend(f"- {item}" for item in download_errors[:8])
+            lines.extend(f"- {item}" for item in download_errors[:4])
         if failed:
             lines.append(f"JSON 失败: {len(failed)} 个")
-            for path, reason in failed[:8]:
+            for path, reason in failed[:4]:
                 lines.append(f"- {os.path.basename(path)}: {reason}")
 
         box = MessageBox("提取结果", "\n".join(lines), self.window())

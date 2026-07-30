@@ -1,6 +1,7 @@
 """从 MS JSON 批量提取曲目元数据、下载直链资源并生成 Excel。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -66,6 +67,7 @@ RESOURCE_FIELDS: tuple[tuple[str, str, str], ...] = (
 class SongMetadataRow:
     values: list[str]
     download_errors: list[str] = field(default_factory=list)
+    cache_hits: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -74,6 +76,7 @@ class MetadataExportResult:
     success_count: int
     failed: list[tuple[str, str]]
     download_errors: list[str]
+    cache_hits: list[str] = field(default_factory=list)
 
 
 def _resource_basename(mr_id: int, field_name: str) -> str:
@@ -183,14 +186,29 @@ def _save_resource(
     mr_id: int,
     default_suffix: str,
     field_name: str = "",
-) -> str:
+) -> tuple[str, str | None]:
+    """保存资源到输出目录，返回 (相对路径, 缓存命中消息或 None)。"""
     value = (url_or_path or "").strip()
     if not value:
-        return ""
+        return "", None
 
     dest_dir = output_dir / subfolder
 
     if value.startswith(("http://", "https://")):
+        cache_hit_msg: str | None = None
+        if field_name != "album_cover_path":
+            # 检查音频缓存：复用音频下载/校准的 .ms_json_audio_cache/
+            url_suffix = Path(value.split("?", 1)[0]).suffix or default_suffix
+            cache_dir = Path(json_path).parent / ".ms_json_audio_cache"
+            cache_name = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32] + url_suffix
+            cache_path = cache_dir / cache_name
+            if cache_path.is_file() and cache_path.stat().st_size > 0:
+                dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{url_suffix}"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cache_path, dest_path)
+                cache_hit_msg = "已执行过音频下载或音频校准的曲目，元数据提取时会自动复用缓存，跳过重复下载"
+                return str(dest_path.relative_to(output_dir)), cache_hit_msg
+
         if field_name == "album_cover_path":
             try:
                 data, content_type = _fetch_url(value)
@@ -206,14 +224,14 @@ def _save_resource(
                 _download_url_to_file(value, dest_path)
             except urllib.error.URLError as exc:
                 raise FileNotFoundError(f"下载失败: {value} ({exc})") from exc
+        return str(dest_path.relative_to(output_dir)), None
     else:
         suffix = _suffix_from_url(value, default_suffix)
         dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
         source = _resolve_local_source(value, json_path)
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, dest_path)
-
-    return str(dest_path.relative_to(output_dir))
+        return str(dest_path.relative_to(output_dir)), None
 
 
 def build_metadata_row(
@@ -232,6 +250,7 @@ def build_metadata_row(
     resource_locals: dict[str, str] = {}
     errors: list[str] = []
 
+    cache_hits: list[str] = []
     for field_name, subfolder, default_suffix in RESOURCE_FIELDS:
         url = str(raw.get(field_name, "") or "").strip()
         resource_urls[field_name] = url
@@ -239,7 +258,7 @@ def build_metadata_row(
         if not url or not download_resources:
             continue
         try:
-            resource_locals[field_name] = _save_resource(
+            local_path, cache_msg = _save_resource(
                 url,
                 json_path=song.source_path,
                 output_dir=output_dir,
@@ -248,6 +267,9 @@ def build_metadata_row(
                 default_suffix=default_suffix,
                 field_name=field_name,
             )
+            resource_locals[field_name] = local_path
+            if cache_msg:
+                cache_hits.append(cache_msg)
         except Exception as exc:
             errors.append(f"{field_name}: {exc}")
 
@@ -288,7 +310,7 @@ def build_metadata_row(
         resource_urls.get("file_mr_drum_w", ""),
         resource_locals.get("file_mr_drum_w", ""),
     ]
-    return SongMetadataRow(values=values, download_errors=errors)
+    return SongMetadataRow(values=values, download_errors=errors, cache_hits=cache_hits)
 
 
 def write_metadata_excel(rows: list[list[str]], output_dir: str) -> str:
@@ -337,6 +359,7 @@ def export_songs_metadata(
     rows: list[list[str]] = []
     failed: list[tuple[str, str]] = []
     all_download_errors: list[str] = []
+    all_cache_hits: list[str] = []
 
     for index, path in enumerate(json_paths, start=1):
         name = os.path.basename(path)
@@ -357,6 +380,8 @@ def export_songs_metadata(
             rows.append(row.values)
             for error in row.download_errors:
                 all_download_errors.append(f"{name} ({song.mr_id}): {error}")
+            for msg in row.cache_hits:
+                all_cache_hits.append(f"{name} ({song.mr_id}): {msg}")
         except Exception as exc:
             failed.append((path, str(exc)))
 
@@ -369,4 +394,5 @@ def export_songs_metadata(
         success_count=len(rows),
         failed=failed,
         download_errors=all_download_errors,
+        cache_hits=all_cache_hits,
     )

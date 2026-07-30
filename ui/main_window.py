@@ -45,7 +45,7 @@ class ExportWorker(QThread):
 
     def __init__(
         self,
-        json_paths: list[str],
+        input_path: str,
         output_dir: str,
         part_mode: str,
         lyric_field: str,
@@ -61,7 +61,7 @@ class ExportWorker(QThread):
         parent=None,
     ):
         super().__init__(parent)
-        self.json_paths = json_paths
+        self.input_path = input_path
         self.output_dir = output_dir
         self.part_mode = part_mode
         self.lyric_field = lyric_field
@@ -76,10 +76,18 @@ class ExportWorker(QThread):
         self.audio_reference_calibration = audio_reference_calibration
 
     def run(self):
-        result = ExportResult(success=[], failed=[], skipped=0, calibration_notes=[])
-        total = len(self.json_paths)
+        from core.parser import collect_json_files
 
-        for index, path in enumerate(self.json_paths, start=1):
+        self.progress.emit(0, "正在扫描 JSON 文件…")
+        json_paths = collect_json_files(self.input_path, valid_only=True)
+        if not json_paths:
+            self.finished.emit(ExportResult(success=[], failed=[], skipped=0, calibration_notes=[]))
+            return
+
+        result = ExportResult(success=[], failed=[], skipped=0, calibration_notes=[])
+        total = len(json_paths)
+
+        for index, path in enumerate(json_paths, start=1):
             name = os.path.basename(path)
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
             try:
@@ -297,17 +305,6 @@ class ExportPage(ScrollArea):
             )
             return
 
-        json_paths = collect_json_files(input_path, valid_only=True)
-        if not json_paths:
-            InfoBar.warning(
-                "未找到有效 JSON",
-                "路径下没有包含 mnote 数据的有效 JSON 文件。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
-            return
-
         if not output_dir:
             InfoBar.warning(
                 "缺少输出目录",
@@ -319,17 +316,17 @@ class ExportPage(ScrollArea):
             return
 
         self.export_btn.setEnabled(False)
-        self.progress_panel.start(f"共 {len(json_paths)} 个 JSON，准备导出…")
+        self.progress_panel.start("正在扫描 JSON 文件…")
         InfoBar.info(
             "开始导出",
-            f"共 {len(json_paths)} 个 JSON，请稍候…",
+            "正在扫描 JSON 文件，请稍候…",
             duration=2000,
             parent=self.window(),
             position=InfoBarPosition.TOP,
         )
 
         self.worker = ExportWorker(
-            json_paths=json_paths,
+            input_path=input_path,
             output_dir=output_dir,
             part_mode=part_mode,
             lyric_field=lyric_field,
@@ -353,6 +350,16 @@ class ExportPage(ScrollArea):
     def _on_finished(self, result: ExportResult):
         self.export_btn.setEnabled(True)
         self.progress_panel.finish()
+
+        if not result.success and not result.failed:
+            InfoBar.warning(
+                "未找到有效 JSON",
+                "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。",
+                duration=3000,
+                parent=self.window(),
+                position=InfoBarPosition.TOP,
+            )
+            return
 
         if result.success and not result.failed:
             detail = f"成功导出 {len(result.success)} 个 MIDI 文件。"

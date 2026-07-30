@@ -61,10 +61,10 @@ class LocalLyricWorker(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object)
 
-    def __init__(self, bundles, output_dir, lyric_field, lyric_format, part, title_lang, artist_lang,
+    def __init__(self, parent_dir, output_dir, lyric_field, lyric_format, part, title_lang, artist_lang,
                  ksc_options, time_offset_ms, audio_reference_calibration, parent=None):
         super().__init__(parent)
-        self.bundles = bundles
+        self.parent_dir = parent_dir
         self.output_dir = output_dir
         self.lyric_field = lyric_field
         self.lyric_format = lyric_format
@@ -76,9 +76,15 @@ class LocalLyricWorker(QThread):
         self.audio_reference_calibration = audio_reference_calibration
 
     def run(self):
+        self.progress.emit(0, "正在扫描母文件夹…")
+        try:
+            bundles = scan_local_parent_dir(self.parent_dir)
+        except ValueError as exc:
+            self.finished.emit(LocalLyricResult(success=[], failed=[(self.parent_dir, str(exc))], calibration_notes=[]))
+            return
         result = LocalLyricResult(success=[], failed=[], calibration_notes=[])
-        total = len(self.bundles)
-        for index, bundle in enumerate(self.bundles, start=1):
+        total = len(bundles)
+        for index, bundle in enumerate(bundles, start=1):
             name = os.path.basename(bundle.json_path)
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
             try:
@@ -106,10 +112,10 @@ class LocalSectionWorker(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object)
 
-    def __init__(self, bundles, output_dir, lyric_field, title_lang, artist_lang,
+    def __init__(self, parent_dir, output_dir, lyric_field, title_lang, artist_lang,
                  time_offset_ms, audio_reference_calibration, parent=None):
         super().__init__(parent)
-        self.bundles = bundles
+        self.parent_dir = parent_dir
         self.output_dir = output_dir
         self.lyric_field = lyric_field
         self.title_lang = title_lang
@@ -118,10 +124,16 @@ class LocalSectionWorker(QThread):
         self.audio_reference_calibration = audio_reference_calibration
 
     def run(self):
+        self.progress.emit(0, "正在扫描母文件夹…")
         try:
-            total = len(self.bundles)
+            bundles = scan_local_parent_dir(self.parent_dir)
+        except ValueError as exc:
+            self.finished.emit(LocalSectionResult(error=str(exc)))
+            return
+        try:
+            total = len(bundles)
             all_rows = []
-            for index, bundle in enumerate(self.bundles, start=1):
+            for index, bundle in enumerate(bundles, start=1):
                 name = os.path.basename(bundle.json_path)
                 self.progress.emit(int(index / total * 100), f"正在处理: {name}")
                 song = load_local_song_json(bundle.json_path, self.lyric_field)
@@ -289,21 +301,16 @@ class LocalLyricExportPage(ScrollArea):
         if folder:
             self.output_edit.setText(folder)
 
-    def _scan_bundles(self) -> list[LocalSongBundle] | None:
+    def _validate_inputs(self) -> tuple[str, str] | None:
         parent_dir = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-        if not parent_dir or not os.path.exists(parent_dir):
+        if not parent_dir or not os.path.isdir(parent_dir):
             InfoBar.warning("路径无效", "请输入或拖入有效的母文件夹路径。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
         if not output_dir:
             InfoBar.warning("缺少输出目录", "请选择输出目录。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
             return None
-        try:
-            bundles = scan_local_parent_dir(parent_dir)
-        except ValueError as exc:
-            InfoBar.warning("未找到有效资源", str(exc), duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
-            return None
-        return bundles
+        return parent_dir, output_dir
 
     def _set_buttons_enabled(self, enabled: bool):
         self.export_btn.setEnabled(enabled)
@@ -312,10 +319,10 @@ class LocalLyricExportPage(ScrollArea):
             self.progress_panel.finish()
 
     def _start_export(self):
-        bundles = self._scan_bundles()
-        if bundles is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-        output_dir = self.output_edit.text().strip()
+        parent_dir, output_dir = paths
         lyric_field = LYRIC_FIELD_OPTIONS[self.lyric_combo.currentIndex()][1]
         lyric_format = self._current_lyric_format()
         part = LYRIC_PART_LABELS[self.part_combo.currentIndex()][1]
@@ -329,8 +336,8 @@ class LocalLyricExportPage(ScrollArea):
         audio_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_buttons_enabled(False)
-        self.progress_panel.start(f"共 {len(bundles)} 个 MSID，准备导出…")
-        InfoBar.info("开始导出", f"共 {len(bundles)} 个 MSID，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+        self.progress_panel.start("正在扫描母文件夹…")
+        InfoBar.info("开始导出", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
         self.lyric_worker = LocalLyricWorker(
             bundles, output_dir, lyric_field, lyric_format, part, title_lang, artist_lang,
@@ -341,10 +348,10 @@ class LocalLyricExportPage(ScrollArea):
         self.lyric_worker.start()
 
     def _start_section_export(self):
-        bundles = self._scan_bundles()
-        if bundles is None:
+        paths = self._validate_inputs()
+        if paths is None:
             return
-        output_dir = self.output_edit.text().strip()
+        parent_dir, output_dir = paths
         lyric_field = LYRIC_FIELD_OPTIONS[self.lyric_combo.currentIndex()][1]
         title_lang = META_LANG_LABELS[self.title_lang_combo.currentIndex()][1]
         artist_lang = META_LANG_LABELS[self.artist_lang_combo.currentIndex()][1]
@@ -352,8 +359,8 @@ class LocalLyricExportPage(ScrollArea):
         audio_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_buttons_enabled(False)
-        self.progress_panel.start(f"共 {len(bundles)} 个 MSID，准备导出段落信息…")
-        InfoBar.info("开始导出段落信息", f"共 {len(bundles)} 个 MSID，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+        self.progress_panel.start("正在扫描母文件夹…")
+        InfoBar.info("开始导出段落信息", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
         self.section_worker = LocalSectionWorker(
             bundles, output_dir, lyric_field, title_lang, artist_lang, time_offset_ms, audio_calibration,

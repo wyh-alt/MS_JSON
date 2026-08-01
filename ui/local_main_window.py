@@ -17,15 +17,15 @@ class LocalMainWindow(FluentWindow):
             from PyQt6.QtGui import QIcon
             self.setWindowIcon(QIcon(icon_path))
 
-        from ui.local_pages.local_audio_download_page import LocalAudioDownloadPage
-        self.audio_download_page = LocalAudioDownloadPage(self)
-        self.audio_download_page.setObjectName("localAudioDownloadInterface")
-        self.addSubInterface(self.audio_download_page, FIF.DOWNLOAD, "音频导出")
-
         from ui.local_pages.local_metadata_export_page import LocalMetadataExportPage
         self.metadata_export_page = LocalMetadataExportPage(self)
         self.metadata_export_page.setObjectName("localMetadataExportInterface")
         self.addSubInterface(self.metadata_export_page, FIF.INFO, "元数据提取")
+
+        from ui.local_pages.local_audio_download_page import LocalAudioDownloadPage
+        self.audio_download_page = LocalAudioDownloadPage(self)
+        self.audio_download_page.setObjectName("localAudioDownloadInterface")
+        self.addSubInterface(self.audio_download_page, FIF.DOWNLOAD, "音频导出")
 
         from ui.local_pages.local_lyric_export_page import LocalLyricExportPage
         self.lyric_export_page = LocalLyricExportPage(self)

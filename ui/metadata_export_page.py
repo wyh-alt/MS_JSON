@@ -9,7 +9,6 @@ from qfluentwidgets import (
     CheckBox,
     InfoBar,
     InfoBarPosition,
-    MessageBox,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -19,7 +18,7 @@ from qfluentwidgets import (
 
 from core.metadata_exporter import export_songs_metadata
 from core.parser import collect_json_files
-from ui.widgets import BatchProgressPanel, DragLineEdit
+from ui.widgets import BatchProgressPanel, DragLineEdit, ScrollableMessageBox
 
 
 @dataclass
@@ -59,7 +58,11 @@ class MetadataExportWorker(QThread):
                 return
 
             def on_progress(index: int, total: int, name: str):
-                self.progress.emit(int(index / total * 100), f"正在处理: {name}")
+                # 兜底重试轮：进度保持 100%，消息带“重试: ”前缀
+                if name.startswith("重试:"):
+                    self.progress.emit(100, f"正在{name}")
+                else:
+                    self.progress.emit(int(index / total * 100), f"正在处理: {name}")
 
             result = export_songs_metadata(
                 json_paths,
@@ -245,14 +248,12 @@ class MetadataExportPage(ScrollArea):
         if cache_hits:
             lines.append(cache_hits[0])
         if download_errors:
-            lines.append(f"资源下载问题: {len(download_errors)} 项")
-            lines.extend(f"- {item}" for item in download_errors[:4])
+            lines.append(f"资源下载失败（已自动重试一次，仍失败）: {len(download_errors)} 项")
+            lines.extend(f"- {item}" for item in download_errors)
         if failed:
-            lines.append(f"JSON 失败: {len(failed)} 个")
-            for path, reason in failed[:4]:
+            lines.append(f"JSON 失败（已自动重试一次，仍失败）: {len(failed)} 个")
+            for path, reason in failed:
                 lines.append(f"- {os.path.basename(path)}: {reason}")
 
-        box = MessageBox("提取结果", "\n".join(lines), self.window())
-        box.yesButton.setText("确定")
-        box.cancelButton.hide()
+        box = ScrollableMessageBox("提取结果", "\n".join(lines), self.window())
         box.exec()

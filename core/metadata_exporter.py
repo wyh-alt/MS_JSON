@@ -5,12 +5,11 @@ import hashlib
 import json
 import os
 import shutil
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from core.audio_downloader import CACHE_DIR_NAME, download_cached_file
 from core.parser import SongData, is_valid_ms_json, load_song_json
 
 METADATA_EXCEL_NAME = "曲目元数据.xlsx"
@@ -98,21 +97,8 @@ def _suffix_from_url(url: str, default: str) -> str:
     return suffix if suffix else default
 
 
-def _detect_image_suffix(data: bytes, content_type: str | None = None) -> str:
-    """根据 Content-Type 或文件头魔数识别图片格式，返回固定扩展名。"""
-    if content_type:
-        normalized = content_type.split(";", 1)[0].strip().lower()
-        for mime, suffix in (
-            ("image/jpeg", ".jpg"),
-            ("image/jpg", ".jpg"),
-            ("image/png", ".png"),
-            ("image/webp", ".webp"),
-            ("image/gif", ".gif"),
-            ("image/bmp", ".bmp"),
-        ):
-            if normalized == mime:
-                return suffix
-
+def _detect_image_suffix(data: bytes) -> str:
+    """根据文件头魔数识别图片格式，返回固定扩展名。"""
     if data.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -124,28 +110,6 @@ def _detect_image_suffix(data: bytes, content_type: str | None = None) -> str:
     if data.startswith(b"BM"):
         return ".bmp"
     return ".jpg"
-
-
-def _fetch_url(url: str) -> tuple[bytes, str | None]:
-    request = urllib.request.Request(url, headers={"User-Agent": "MS_json/1.0"})
-    with urllib.request.urlopen(request, timeout=120) as response:
-        data = response.read()
-        content_type = response.headers.get("Content-Type")
-    if not data:
-        raise ValueError("下载的文件为空")
-    return data, content_type
-
-
-def _write_bytes_atomic(dest_path: Path, data: bytes) -> None:
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = dest_path.with_suffix(dest_path.suffix + ".part")
-    try:
-        temp_path.write_bytes(data)
-        os.replace(temp_path, dest_path)
-    except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
 
 
 def _format_tempos(tempos: list[dict[str, Any]]) -> str:
@@ -160,11 +124,6 @@ def _format_tempos(tempos: list[dict[str, Any]]) -> str:
         end_label = "" if end_ms in (None, "") else f"@{int(end_ms)}ms"
         parts.append(f"{float(tempo):.3f}{end_label}")
     return "; ".join(parts)
-
-
-def _download_url_to_file(url: str, dest_path: Path) -> None:
-    data, _ = _fetch_url(url)
-    _write_bytes_atomic(dest_path, data)
 
 
 def _resolve_local_source(value: str, json_path: str) -> Path:
@@ -187,7 +146,11 @@ def _save_resource(
     default_suffix: str,
     field_name: str = "",
 ) -> tuple[str, str | None]:
-    """保存资源到输出目录，返回 (相对路径, 缓存命中消息或 None)。"""
+    """保存资源到输出目录，返回 (相对路径, 缓存命中消息或 None)。
+
+    所有直链资源先下载到 JSON 原目录的共用缓存（.ms_json_audio_cache/），
+    再从缓存拷贝到输出目录并重命名，保证音频下载、音频校准等模块可复用缓存。
+    """
     value = (url_or_path or "").strip()
     if not value:
         return "", None
@@ -195,36 +158,28 @@ def _save_resource(
     dest_dir = output_dir / subfolder
 
     if value.startswith(("http://", "https://")):
-        cache_hit_msg: str | None = None
-        if field_name != "album_cover_path":
-            # 检查音频缓存：复用音频下载/校准的 .ms_json_audio_cache/
-            url_suffix = Path(value.split("?", 1)[0]).suffix or default_suffix
-            cache_dir = Path(json_path).parent / ".ms_json_audio_cache"
-            cache_name = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32] + url_suffix
-            cache_path = cache_dir / cache_name
-            if cache_path.is_file() and cache_path.stat().st_size > 0:
-                dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{url_suffix}"
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(cache_path, dest_path)
-                cache_hit_msg = "已执行过音频下载或音频校准的曲目，元数据提取时会自动复用缓存，跳过重复下载"
-                return str(dest_path.relative_to(output_dir)), cache_hit_msg
+        # 与音频下载/校准模块相同的缓存命名：sha256(url)[:32] + 后缀
+        suffix = _suffix_from_url(value, default_suffix)
+        cache_dir = Path(json_path).parent / CACHE_DIR_NAME
+        cache_name = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32] + suffix
+        cache_path = cache_dir / cache_name
+        cache_hit = cache_path.is_file() and cache_path.stat().st_size > 0
+
+        cache_path = download_cached_file(value, json_path, default_suffix)
 
         if field_name == "album_cover_path":
-            try:
-                data, content_type = _fetch_url(value)
-            except urllib.error.URLError as exc:
-                raise FileNotFoundError(f"下载失败: {value} ({exc})") from exc
-            suffix = _detect_image_suffix(data, content_type)
-            dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
-            _write_bytes_atomic(dest_path, data)
-        else:
-            suffix = _suffix_from_url(value, default_suffix)
-            dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
-            try:
-                _download_url_to_file(value, dest_path)
-            except urllib.error.URLError as exc:
-                raise FileNotFoundError(f"下载失败: {value} ({exc})") from exc
-        return str(dest_path.relative_to(output_dir)), None
+            # 封面真实格式以文件头魔数识别为准（URL 后缀可能缺失或不准确）
+            suffix = _detect_image_suffix(cache_path.read_bytes())
+        dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cache_path, dest_path)
+
+        cache_hit_msg = (
+            "已执行过音频下载或音频校准的曲目，元数据提取时会自动复用缓存，跳过重复下载"
+            if cache_hit and field_name != "album_cover_path"
+            else None
+        )
+        return str(dest_path.relative_to(output_dir)), cache_hit_msg
     else:
         suffix = _suffix_from_url(value, default_suffix)
         dest_path = dest_dir / f"{_resource_basename(mr_id, field_name)}{suffix}"
@@ -348,6 +303,25 @@ def write_metadata_excel(rows: list[list[str]], output_dir: str) -> str:
     return output_path
 
 
+def _build_song_row(
+    path: str,
+    output_path: Path,
+    download_resources: bool,
+) -> tuple[SongData, SongMetadataRow]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not is_valid_ms_json(raw):
+        raise ValueError("不是有效的 MS JSON 文件")
+    song = load_song_json(path)
+    row = build_metadata_row(
+        song,
+        raw,
+        output_dir=output_path,
+        download_resources=download_resources,
+    )
+    return song, row
+
+
 def export_songs_metadata(
     json_paths: list[str],
     output_dir: str,
@@ -355,38 +329,66 @@ def export_songs_metadata(
     download_resources: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> MetadataExportResult:
+    """批量提取元数据并下载直链资源。
+
+    第一轮逐首处理，遇到下载失败（链接超时等）的任务跳过并继续下一个；
+    全部处理完后，对失败任务（含整首失败与资源下载失败但整首成功）做一次兜底重试，
+    利用缓存只重新下载失败资源；重试后仍失败的任务列入最终 failed，由调用方弹窗列举。
+    重试轮的 progress_callback 任务名带“重试: ”前缀。
+    """
     output_path = Path(output_dir)
-    rows: list[list[str]] = []
-    failed: list[tuple[str, str]] = []
-    all_download_errors: list[str] = []
-    all_cache_hits: list[str] = []
+    # path -> (mr_id, row)，重试成功后覆盖第一轮结果，保持 json_paths 顺序输出
+    song_rows: dict[str, tuple[int, SongMetadataRow]] = {}
+    # path -> 第一轮整首失败原因（重试成功则移除）
+    pending: dict[str, str] = {}
 
     for index, path in enumerate(json_paths, start=1):
         name = os.path.basename(path)
         if progress_callback is not None:
             progress_callback(index, len(json_paths), name)
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if not is_valid_ms_json(raw):
-                raise ValueError("不是有效的 MS JSON 文件")
-            song = load_song_json(path)
-            row = build_metadata_row(
-                song,
-                raw,
-                output_dir=output_path,
-                download_resources=download_resources,
-            )
-            rows.append(row.values)
-            for error in row.download_errors:
-                all_download_errors.append(f"{name} ({song.mr_id}): {error}")
-            for msg in row.cache_hits:
-                all_cache_hits.append(f"{name} ({song.mr_id}): {msg}")
+            song, row = _build_song_row(path, output_path, download_resources)
+            song_rows[path] = (song.mr_id, row)
         except Exception as exc:
-            failed.append((path, str(exc)))
+            pending[path] = str(exc)
+
+    # 兜底重试：整首失败 + 有资源下载错误的曲目（已成功资源命中缓存，只重下失败资源）
+    retry_targets = [
+        path
+        for path in json_paths
+        if path in pending
+        or (path in song_rows and song_rows[path][1].download_errors)
+    ]
+    total_retry = len(retry_targets)
+    for index, path in enumerate(retry_targets, start=1):
+        name = os.path.basename(path)
+        if progress_callback is not None:
+            progress_callback(index, total_retry, f"重试: {name}")
+        try:
+            song, row = _build_song_row(path, output_path, download_resources)
+            song_rows[path] = (song.mr_id, row)
+            pending.pop(path, None)
+        except Exception as exc:
+            pending[path] = str(exc)
+
+    rows = [song_rows[path][1].values for path in json_paths if path in song_rows]
+    failed = [(path, pending[path]) for path in json_paths if path in pending]
 
     if not rows:
         raise ValueError("没有成功提取的曲目元数据")
+
+    all_download_errors = [
+        f"{os.path.basename(path)} ({song_rows[path][0]}): {error}"
+        for path in json_paths
+        if path in song_rows
+        for error in song_rows[path][1].download_errors
+    ]
+    all_cache_hits = [
+        f"{os.path.basename(path)} ({song_rows[path][0]}): {msg}"
+        for path in json_paths
+        if path in song_rows
+        for msg in song_rows[path][1].cache_hits
+    ]
 
     excel_path = write_metadata_excel(rows, output_dir)
     return MetadataExportResult(

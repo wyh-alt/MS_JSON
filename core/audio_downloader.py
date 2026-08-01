@@ -19,6 +19,9 @@ from core.parser import SongData
 # Windows 下调用 ffmpeg 时抑制一闪而过的控制台窗口
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
+# JSON 原目录下的共用资源缓存：元数据提取、音频下载、音频校准等模块共用
+CACHE_DIR_NAME = ".ms_json_audio_cache"
+
 # 第一遍只用来测量，LRA 取多少都不影响 measured_* 结果
 _MEASURE_LRA = 11.0
 
@@ -237,9 +240,14 @@ def resolve_audio_file(url_or_path: str, json_path: str) -> Path:
     raise FileNotFoundError(f"找不到 MR 音频: {value}")
 
 
-def download_cached_audio(url: str, json_path: str) -> Path:
-    suffix = Path(url.split("?", 1)[0]).suffix or ".m4a"
-    cache_dir = Path(json_path).parent / ".ms_json_audio_cache"
+def download_cached_file(url: str, json_path: str, default_suffix: str = ".m4a") -> Path:
+    """下载任意 URL 资源到 JSON 原目录缓存（.ms_json_audio_cache/），返回缓存路径。
+
+    所有模块共用同一缓存：元数据提取、音频下载、音频校准等先落缓存再取用，
+    命中的缓存文件直接复用，跳过重复下载。缓存名 = sha256(url)[:32] + 后缀。
+    """
+    suffix = Path(url.split("?", 1)[0]).suffix or default_suffix
+    cache_dir = Path(json_path).parent / CACHE_DIR_NAME
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] + suffix
     cache_path = cache_dir / cache_name
@@ -253,19 +261,23 @@ def download_cached_audio(url: str, json_path: str) -> Path:
         with urllib.request.urlopen(request, timeout=120) as response:
             data = response.read()
         if not data:
-            raise ValueError("下载的音频文件为空")
+            raise ValueError("下载的文件为空")
         temp_path.write_bytes(data)
         os.replace(temp_path, cache_path)
     except urllib.error.URLError as exc:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
-        raise FileNotFoundError(f"下载 MR 音频失败: {url} ({exc})") from exc
+        raise FileNotFoundError(f"下载失败: {url} ({exc})") from exc
     except Exception:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
         raise
 
     return cache_path
+
+
+def download_cached_audio(url: str, json_path: str) -> Path:
+    return download_cached_file(url, json_path, ".m4a")
 
 
 def find_ffmpeg_executable() -> str | None:

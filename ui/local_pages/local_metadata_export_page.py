@@ -10,7 +10,6 @@ from qfluentwidgets import (
     CardWidget,
     InfoBar,
     InfoBarPosition,
-    MessageBox,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -29,7 +28,7 @@ from core.metadata_exporter import (
     write_metadata_excel,
 )
 from core.local_resolver import load_local_song_json
-from ui.widgets import BatchProgressPanel, DragLineEdit
+from ui.widgets import BatchProgressPanel, DragLineEdit, ScrollableMessageBox
 
 # 直链（URL）列的索引（0-based）：偶数索引 16..30
 _URL_COLUMN_INDICES = {16, 18, 20, 22, 24, 26, 28, 30}
@@ -244,13 +243,11 @@ class LocalMetadataExportPage(ScrollArea):
             lines.append(cache_hits[0])
         if resource_errors:
             lines.append(f"资源问题: {len(resource_errors)} 项")
-            lines.extend(f"- {item}" for item in resource_errors[:4])
+            lines.extend(f"- {item}" for item in resource_errors)
         if failed:
             lines.append(f"失败: {len(failed)} 个")
-            for path, reason in failed[:4]:
+            for path, reason in failed:
                 dir_name = os.path.basename(os.path.dirname(path))
                 lines.append(f"- {dir_name}/{os.path.basename(path)}: {reason}")
-        box = MessageBox("提取结果", "\n".join(lines), self.window())
-        box.yesButton.setText("确定")
-        box.cancelButton.hide()
+        box = ScrollableMessageBox("提取结果", "\n".join(lines), self.window())
         box.exec()

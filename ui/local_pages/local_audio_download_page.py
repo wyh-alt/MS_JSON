@@ -10,7 +10,6 @@ from qfluentwidgets import (
     CheckBox,
     InfoBar,
     InfoBarPosition,
-    MessageBox,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -40,6 +39,7 @@ from ui.widgets import (
     COMPACT_CONTROL_HEIGHT,
     BatchProgressPanel,
     DragLineEdit,
+    ScrollableMessageBox,
     create_compact_combo,
     create_signed_value_input,
 )
@@ -384,9 +384,7 @@ class LocalAudioDownloadPage(ScrollArea):
         lines = [f"成功: {len(result.success)} 个音频文件"]
         if result.failed:
             lines.append(f"失败: {len(result.failed)} 个 MSID")
-            for path, reason in result.failed[:8]:
+            for path, reason in result.failed:
                 lines.append(f"- {os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}: {reason}")
-        box = MessageBox("导出结果", "\n".join(lines), self.window())
-        box.yesButton.setText("确定")
-        box.cancelButton.hide()
+        box = ScrollableMessageBox("导出结果", "\n".join(lines), self.window())
         box.exec()

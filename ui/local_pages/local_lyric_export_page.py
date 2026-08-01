@@ -10,7 +10,6 @@ from qfluentwidgets import (
     CheckBox,
     InfoBar,
     InfoBarPosition,
-    MessageBox,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -33,7 +32,13 @@ from core.lyric_exporter import (
     write_sections_excel,
 )
 from core.local_resolver import load_local_song_json
-from ui.widgets import BatchProgressPanel, DragLineEdit, create_compact_combo, create_offset_spinbox
+from ui.widgets import (
+    BatchProgressPanel,
+    DragLineEdit,
+    ScrollableMessageBox,
+    create_compact_combo,
+    create_offset_spinbox,
+)
 
 LYRIC_FIELD_OPTIONS = [
     ("原文歌词", "ori"),
@@ -380,23 +385,25 @@ class LocalLyricExportPage(ScrollArea):
         if result.success and not result.failed:
             detail = f"成功导出 {len(result.success)} 个歌词文件。"
             if result.calibration_notes:
-                detail += "\n" + "\n".join(result.calibration_notes[:5])
-                if len(result.calibration_notes) > 5:
-                    detail += f"\n... 另有 {len(result.calibration_notes) - 5} 条校准记录"
-            InfoBar.success("导出完成", detail, duration=6000, parent=self.window(), position=InfoBarPosition.TOP)
+                detail += "\n音频校准:\n" + "\n".join(
+                    f"- {note}" for note in result.calibration_notes
+                )
+            if len(result.calibration_notes) > 5:
+                # 校准记录较多时用可滚动弹窗展示全部，便于核实
+                ScrollableMessageBox("导出完成", detail, self.window()).exec()
+            else:
+                InfoBar.success("导出完成", detail, duration=6000, parent=self.window(), position=InfoBarPosition.TOP)
             return
         lines = [f"成功: {len(result.success)} 个歌词文件"]
         if result.calibration_notes:
             lines.append("音频校准:")
-            lines.extend(f"- {note}" for note in result.calibration_notes[:8])
+            lines.extend(f"- {note}" for note in result.calibration_notes)
         if result.failed:
             lines.append(f"失败: {len(result.failed)} 个 MSID")
-            for path, reason in result.failed[:8]:
+            for path, reason in result.failed:
                 dir_name = os.path.basename(os.path.dirname(path))
                 lines.append(f"- {dir_name}/{os.path.basename(path)}: {reason}")
-        box = MessageBox("导出结果", "\n".join(lines), self.window())
-        box.yesButton.setText("确定")
-        box.cancelButton.hide()
+        box = ScrollableMessageBox("导出结果", "\n".join(lines), self.window())
         box.exec()
 
     def _on_section_finished(self, result: LocalSectionResult):

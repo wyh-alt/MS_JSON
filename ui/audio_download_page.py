@@ -9,7 +9,6 @@ from qfluentwidgets import (
     CheckBox,
     InfoBar,
     InfoBarPosition,
-    MessageBox,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -34,6 +33,7 @@ from ui.widgets import (
     COMPACT_CONTROL_HEIGHT,
     BatchProgressPanel,
     DragLineEdit,
+    ScrollableMessageBox,
     create_compact_combo,
     create_signed_value_input,
 )
@@ -72,10 +72,23 @@ class AudioDownloadWorker(QThread):
             self.finished.emit(result)
             return
 
+        # 第一轮：逐首下载，失败（链接超时等）的任务跳过并继续下一个
+        first_failed: list[tuple[str, str]] = []
         total = len(json_paths)
         for index, path in enumerate(json_paths, start=1):
             name = os.path.basename(path)
             self.progress.emit(int(index / total * 100), f"正在处理: {name}")
+            try:
+                song = load_song_json(path)
+                output_path = export_song_audio(song, self.output_dir, self.options)
+                result.success.append(output_path)
+            except Exception as exc:
+                first_failed.append((path, str(exc)))
+
+        # 兜底重试：全部处理完后，对第一轮失败的任务重试一次（已成功资源命中缓存）
+        for index, (path, _) in enumerate(first_failed, start=1):
+            name = os.path.basename(path)
+            self.progress.emit(100, f"正在重试: {name}")
             try:
                 song = load_song_json(path)
                 output_path = export_song_audio(song, self.output_dir, self.options)
@@ -419,11 +432,9 @@ class AudioDownloadPage(ScrollArea):
 
         lines = [f"成功: {len(result.success)} 个音频文件"]
         if result.failed:
-            lines.append(f"失败: {len(result.failed)} 个 JSON 文件")
-            for path, reason in result.failed[:8]:
+            lines.append(f"失败（已自动重试一次，仍失败）: {len(result.failed)} 个 JSON 文件")
+            for path, reason in result.failed:
                 lines.append(f"- {os.path.basename(path)}: {reason}")
 
-        box = MessageBox("下载结果", "\n".join(lines), self.window())
-        box.yesButton.setText("确定")
-        box.cancelButton.hide()
+        box = ScrollableMessageBox("下载结果", "\n".join(lines), self.window())
         box.exec()

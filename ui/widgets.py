@@ -1,6 +1,23 @@
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtWidgets import QAbstractSpinBox, QHBoxLayout, QVBoxLayout, QWidget
-from qfluentwidgets import BodyLabel, ComboBox, CompactSpinBox, LineEdit, ProgressBar, TransparentToolButton
+from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QDialog,
+    QHBoxLayout,
+    QVBoxLayout,
+    QWidget,
+)
+from qfluentwidgets import (
+    BodyLabel,
+    ComboBox,
+    CompactSpinBox,
+    LineEdit,
+    PrimaryPushButton,
+    ProgressBar,
+    StrongBodyLabel,
+    TextBrowser,
+    TransparentToolButton,
+    isDarkTheme,
+)
 from qfluentwidgets.common.style_sheet import setCustomStyleSheet
 from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
 from qfluentwidgets.components.widgets.spin_box import SpinIcon
@@ -317,3 +334,50 @@ class BatchProgressPanel(QWidget):
         self.progress_bar.setValue(100)
         self.setVisible(False)
         self.status_label.setText("")
+
+
+class ScrollableMessageBox(QDialog):
+    """可滚动明细弹窗：全部文本展示，超出时滚动查看，支持选中复制。
+
+    用于批量任务完成后列举全部失败明细，替代会截断明细的 MessageBox。
+
+    注意：不继承 qfluentwidgets MessageBox —— 其容器 QSS（border-radius）会导致
+    QAbstractScrollArea 视口尺寸计算异常（Qt 已知问题），滚动区无法正常工作，
+    因此自建 QDialog，仅手动适配深色/浅色主题背景与文字色。
+    """
+
+    def __init__(self, title: str, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(620, 480)
+        self.setMinimumSize(520, 360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        self.title_label = StrongBodyLabel(title, self)
+        layout.addWidget(self.title_label)
+
+        self.text_browser = TextBrowser(self)
+        self.text_browser.setReadOnly(True)
+        self.text_browser.setPlainText(text)
+        self.text_browser.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.text_browser, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.yes_button = PrimaryPushButton("确定", self)
+        self.yes_button.clicked.connect(self.accept)
+        button_row.addWidget(self.yes_button)
+        layout.addLayout(button_row)
+
+        # 主题适配：手动设置对话框背景与文字颜色
+        dark = isDarkTheme()
+        bg = "#292929" if dark else "#FFFFFF"
+        fg = "#F5F5F5" if dark else "#0F0F0F"
+        self.setStyleSheet(
+            f"QDialog {{ background: {bg}; }} QLabel {{ color: {fg}; }}"
+        )

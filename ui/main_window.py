@@ -23,6 +23,7 @@ from core.parser import collect_json_files, load_song_json
 from ui.widgets import (
     BatchProgressPanel,
     DragLineEdit,
+    PathLoader,
     ScrollableMessageBox,
     create_compact_combo,
     create_offset_spinbox,
@@ -45,7 +46,8 @@ class ExportResult:
 
 
 class ExportWorker(QThread):
-    progress = pyqtSignal(int, str)
+    progress = pyqtSignal(float, str)
+    scan_progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)
 
     def __init__(
@@ -64,6 +66,7 @@ class ExportWorker(QThread):
         time_offset_ms: int,
         audio_reference_calibration: bool,
         parent=None,
+        json_paths: list | None = None,
     ):
         super().__init__(parent)
         self.input_path = input_path
@@ -79,12 +82,26 @@ class ExportWorker(QThread):
         self.remove_non_melody_notes = remove_non_melody_notes
         self.time_offset_ms = time_offset_ms
         self.audio_reference_calibration = audio_reference_calibration
+        self.json_paths = json_paths
+
+    def _emit_scan_progress(self, index: int, total: int, name: str) -> None:
+        """按整百分比节流，避免上万文件时信号过密。"""
+        if index == total or int(index / total * 10000) != int((index - 1) / total * 10000):
+            self.scan_progress.emit(index, total)
 
     def run(self):
         from core.parser import collect_json_files
 
-        self.progress.emit(0, "正在扫描 JSON 文件…")
-        json_paths = collect_json_files(self.input_path, valid_only=True)
+        if self.json_paths is not None:
+            # 拖入路径时已预载入完成，直接复用扫描结果
+            json_paths = self.json_paths
+        else:
+            self.progress.emit(0, "正在扫描 JSON 文件…")
+            json_paths = collect_json_files(
+                self.input_path,
+                valid_only=True,
+                progress_callback=self._emit_scan_progress,
+            )
         if not json_paths:
             self.finished.emit(ExportResult(success=[], failed=[], skipped=0, calibration_notes=[]))
             return
@@ -94,7 +111,7 @@ class ExportWorker(QThread):
 
         for index, path in enumerate(json_paths, start=1):
             name = os.path.basename(path)
-            self.progress.emit(int(index / total * 100), f"正在处理: {name}")
+            self.progress.emit(index / total * 100, f"正在处理: {name}")
             try:
                 song = load_song_json(path, self.lyric_field)
                 calibration_log: list[str] = []
@@ -260,6 +277,66 @@ class ExportPage(ScrollArea):
 
         self.worker: ExportWorker | None = None
 
+        # 拖入/输入路径后立即后台载入（扫描校验 JSON），点击开始时直接复用结果
+        self._path_loader: PathLoader | None = None
+        self._loaded_result: tuple[str, list] | None = None
+        self._pending_start = False
+        self._pending_params: dict | None = None
+        self.input_edit.textChanged.connect(self._on_input_path_changed)
+
+    def _scan_loader(self, path, *, progress_callback=None, cancel_check=None):
+        from core.parser import collect_json_files
+
+        return collect_json_files(
+            path,
+            valid_only=True,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def _on_input_path_changed(self, path: str):
+        path = (path or "").strip()
+        # 路径变化时取消待启动任务（等待加载中重新拖入新目录需重新点击开始）
+        self._pending_start = False
+        self._pending_params = None
+        if self._path_loader is not None and self._path_loader.isRunning():
+            self._path_loader.cancel()
+        self._path_loader = None
+        self._loaded_result = None
+        if not path or not os.path.exists(path):
+            self.input_edit.set_scan_progress(None)
+            return
+        # 载入过程中重新拖入新目录：取消旧载入并重新触发
+        self.input_edit.set_scan_progress(0)
+        loader = PathLoader(path, self._scan_loader, self)
+        loader.scan_progress.connect(self._on_scan_progress)
+        loader.finished.connect(self._on_path_loaded)
+        self._path_loader = loader
+        loader.start()
+
+    def _on_path_loaded(self, payload):
+        path, result, error = payload
+        self._path_loader = None
+        if path != self.input_edit.text().strip():
+            return  # 载入期间路径已变化，丢弃过期结果
+        self.input_edit.set_scan_progress(None)
+        if error:
+            self._loaded_result = None
+        else:
+            self._loaded_result = (path, result)
+        if self._pending_start:
+            # 点击开始时预载入未完成：载入结束后自动启动任务
+            self._pending_start = False
+            params = self._pending_params
+            self._pending_params = None
+            self._launch_worker(**params)
+
+    def _loaded_json_paths(self, input_path: str) -> list | None:
+        """返回与当前输入路径匹配的预扫描结果，无则 None。"""
+        if self._loaded_result is not None and self._loaded_result[0] == input_path:
+            return self._loaded_result[1]
+        return None
+
     def _update_lyric_option_visibility(self, checked: bool):
         self.lyric_options_widget.setVisible(checked)
 
@@ -353,18 +430,7 @@ class ExportPage(ScrollArea):
             )
             return
 
-        self.export_btn.setEnabled(False)
-        self._lock_params()
-        self.progress_panel.start("正在扫描 JSON 文件…")
-        InfoBar.info(
-            "开始导出",
-            "正在扫描 JSON 文件，请稍候…",
-            duration=2000,
-            parent=self.window(),
-            position=InfoBarPosition.TOP,
-        )
-
-        self.worker = ExportWorker(
+        params = dict(
             input_path=input_path,
             output_dir=output_dir,
             part_mode=part_mode,
@@ -379,16 +445,68 @@ class ExportPage(ScrollArea):
             time_offset_ms=time_offset_ms,
             audio_reference_calibration=audio_reference_calibration,
         )
+        if self._path_loader is not None and self._path_loader.isRunning():
+            # 预载入尚未完成：等待其结束再启动，避免二次加载导致进度跳回
+            self._pending_start = True
+            self._pending_params = params
+            self.export_btn.setEnabled(False)
+            self._lock_params()
+            self.progress_panel.start("等待加载JSON中 0%")
+            return
+
+        self._launch_worker(**params)
+
+    def _launch_worker(self, **params):
+        input_path = params["input_path"]
+        self.export_btn.setEnabled(False)
+        self._lock_params()
+        self.progress_panel.start("正在扫描 JSON 文件…")
+        InfoBar.info(
+            "开始导出",
+            "正在扫描 JSON 文件，请稍候…",
+            duration=2000,
+            parent=self.window(),
+            position=InfoBarPosition.TOP,
+        )
+
+        # 拖入路径时已预载入完成则直接复用，否则由 worker 自行扫描
+        self.worker = ExportWorker(
+            input_path=input_path,
+            output_dir=params["output_dir"],
+            part_mode=params["part_mode"],
+            lyric_field=params["lyric_field"],
+            write_tempo=params["write_tempo"],
+            write_lyrics=params["write_lyrics"],
+            lyric_granularity=params["lyric_granularity"],
+            lower_octave=params["lower_octave"],
+            write_section_markers=params["write_section_markers"],
+            exclude_rap_sections=params["exclude_rap_sections"],
+            remove_non_melody_notes=params["remove_non_melody_notes"],
+            time_offset_ms=params["time_offset_ms"],
+            audio_reference_calibration=params["audio_reference_calibration"],
+            json_paths=self._loaded_json_paths(input_path),
+        )
         self.worker.progress.connect(self._on_progress)
+        self.worker.scan_progress.connect(self._on_scan_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
+    def _on_scan_progress(self, index: int, total: int) -> None:
+        value = index / total * 100 if total else 100.0
+        self.input_edit.set_scan_progress(value)
+        if getattr(self, "_pending_start", False):
+            # 等待加载阶段：主进度条保持不动，仅状态文字同步百分比
+            self.progress_panel.status_label.setText(f"等待加载JSON中 {value:.2f}%")
+
     def _on_progress(self, value: int, message: str):
+        # 进入逐曲处理阶段，隐藏扫描进度圈
+        self.input_edit.set_scan_progress(None)
         self.progress_panel.update(value, message)
 
     def _on_finished(self, result: ExportResult):
         self.export_btn.setEnabled(True)
         self._unlock_params()
+        self.input_edit.set_scan_progress(None)
         self.progress_panel.finish()
 
         if not result.success and not result.failed:

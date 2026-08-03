@@ -3,7 +3,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 _CJK_CHAR_RE = re.compile(r"[가-힣一-龥ぁ-んァ-ン]")
 _RAP_SECTION_NAME_RE = re.compile(r"^rap\d*$", re.IGNORECASE)
@@ -1059,14 +1059,29 @@ def load_song_json(path: str, lyric_field: str = "ori") -> SongData:
     )
 
 
-def collect_json_files(path: str, *, valid_only: bool = False) -> list[str]:
-    """扫描路径下所有 JSON；valid_only=True 时仅返回含 mnote 的有效文件。"""
+def collect_json_files(
+    path: str,
+    *,
+    valid_only: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[str]:
+    """扫描路径下所有 JSON；valid_only=True 时仅返回含 mnote 的有效文件。
+
+    progress_callback(index, total, name) 在每个文件读取校验时回调，用于展示扫描进度；
+    cancel_check() 返回 True 时中断扫描（用于路径变更后取消旧载入）。
+    """
     files = scan_json_files(path)
     if not valid_only:
         return files
 
     valid_files: list[str] = []
-    for file_path in files:
+    total = len(files)
+    for index, file_path in enumerate(files, start=1):
+        if cancel_check is not None and cancel_check():
+            break
+        if progress_callback is not None:
+            progress_callback(index, total, os.path.basename(file_path))
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)

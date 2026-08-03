@@ -1,8 +1,10 @@
 import os
 import re
+import time
 from datetime import datetime
+from typing import Callable
 
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import QThread, Qt, QSize, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QDialog,
@@ -19,6 +21,7 @@ from qfluentwidgets import (
     MessageBox,
     PrimaryPushButton,
     ProgressBar,
+    ProgressRing,
     PushButton,
     StrongBodyLabel,
     TextBrowser,
@@ -73,9 +76,43 @@ class BorderlessComboBox(ComboBox):
 
 
 class DragLineEdit(LineEdit):
+    """带拖放与右上角扫描进度圈的路径输入框。
+
+    set_scan_progress(value) 在扫描/读取 JSON 文件期间显示确定进度圆弧
+    （从十二点方向顺时针，50% 即到六点方向）；value=None 时隐藏。
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self._scan_ring = ProgressRing(self, useAni=False)
+        self._scan_ring.setFixedSize(18, 18)
+        self._scan_ring.setStrokeWidth(3)  # 细线条,低突出
+        self._scan_ring.setTextVisible(False)
+        # 内部 0-10000 刻度，支持 0.01% 浮点精度，扫描进度更平滑
+        self._scan_ring.setRange(0, 10000)
+        self._scan_ring.hide()
+
+    def set_scan_progress(self, value: float | None) -> None:
+        """显示扫描进度圆弧；value 为 0-100（浮点），None 时隐藏。"""
+        if value is None:
+            self._scan_ring.hide()
+            return
+        self._reposition_scan_ring()
+        self._scan_ring.setValue(int(round(max(0.0, min(100.0, float(value))) * 100)))
+        self._scan_ring.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._scan_ring.isHidden():
+            self._reposition_scan_ring()
+
+    def _reposition_scan_ring(self):
+        ring = self._scan_ring
+        ring.move(
+            max(0, self.width() - ring.width() - 8),
+            max(0, (self.height() - ring.height()) // 2),
+        )
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -309,8 +346,61 @@ def create_signed_value_input(
     )
 
 
+class PathLoader(QThread):
+    """后台载入线程：拖入路径后立即扫描/读取 JSON，支持取消与最新性校验。
+
+    finished 信号携带 (path, result, error)：
+    - result 为扫描结果列表（在线版为 JSON 路径，本地版为 LocalSongBundle）
+    - 路径在载入期间已变化时由页面按 path 与当前输入比对后丢弃过期结果
+    """
+
+    scan_progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+
+    def __init__(
+        self,
+        path: str,
+        loader: Callable[..., list],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.path = path
+        self.loader = loader
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        """请求中断载入（扫描循环会在下一个文件前检查并退出）。"""
+        self.cancelled = True
+
+    def run(self):
+        try:
+            result = self.loader(
+                self.path,
+                progress_callback=lambda i, t, n: self.scan_progress.emit(i, t),
+                cancel_check=lambda: self.cancelled,
+            )
+            self.finished.emit((self.path, result, None))
+        except Exception as exc:
+            self.finished.emit((self.path, None, str(exc)))
+
+
+def _format_eta_duration(seconds: float) -> str:
+    """将秒格式化为中文时长（如 15小时24分钟、24分钟30秒、45秒）。"""
+    total = max(0, int(round(seconds)))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return f"{days}天{hours}小时"
+    if hours:
+        return f"{hours}小时{minutes}分钟"
+    if minutes:
+        return f"{minutes}分钟{seconds}秒"
+    return f"{seconds}秒"
+
+
 class BatchProgressPanel(QWidget):
-    """批量任务进度条与状态文字。"""
+    """批量任务进度条与状态文字，进度条下方以灰色小字显示预估剩余时间（仅作参考）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -320,25 +410,65 @@ class BatchProgressPanel(QWidget):
 
         self.status_label = BodyLabel("", self)
         self.progress_bar = ProgressBar(self)
-        self.progress_bar.setRange(0, 100)
+        # 内部 0-10000 刻度，支持 0.01% 浮点精度，进度更平滑
+        self.progress_bar.setRange(0, 10000)
         self.progress_bar.setValue(0)
         self.progress_bar.setFixedHeight(6)
 
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
+
+        # 预估剩余时间：进度条左下方、灰色弱化，仅作参考
+        dark = isDarkTheme()
+        self.eta_label = BodyLabel("", self)
+        self.eta_label.setStyleSheet(
+            f"color: {'#9A9A9A' if dark else '#707070'}; font-size: 12px;"
+        )
+        layout.addWidget(self.eta_label)
         self.setVisible(False)
+
+        self._start_time: float | None = None
+        self._last_value = 0
+        self._last_eta: float | None = None
 
     def start(self, message: str = "正在处理…") -> None:
         self.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_label.setText(message)
+        self.eta_label.setText("剩余时间计算中")
+        self.eta_label.setVisible(True)
+        self._start_time = time.monotonic()
+        self._last_value = 0
+        self._last_eta = None
 
-    def update(self, value: int, message: str) -> None:
-        self.progress_bar.setValue(max(0, min(100, value)))
+    def update(self, value: float, message: str) -> None:
+        # 进度条按 0.01% 浮点精度显示（内部 0-10000 刻度），提升流畅度
+        value = max(0.0, min(100.0, float(value)))
+        self.progress_bar.setValue(int(round(value * 100)))
         self.status_label.setText(message)
 
+        # ETA 仍按 1% 粒度计算，避免单文件耗时噪音放大导致估算剧烈波动
+        int_value = int(value)
+        if (
+            self._start_time is not None
+            and int_value > self._last_value
+            and int_value > 0
+            and int_value < 100
+        ):
+            elapsed = max(time.monotonic() - self._start_time, 1e-6)
+            self._last_eta = elapsed * (100 - int_value) / int_value
+            self._last_value = int_value
+
+        if int_value >= 100:
+            self.eta_label.setText("即将完成...")
+        elif int_value <= 0 or self._last_eta is None:
+            self.eta_label.setText("剩余时间计算中")
+        else:
+            self.eta_label.setText(f"预计剩余 {_format_eta_duration(self._last_eta)}")
+        self.eta_label.setVisible(True)
+
     def finish(self) -> None:
-        self.progress_bar.setValue(100)
+        self.progress_bar.setValue(10000)
         self.setVisible(False)
         self.status_label.setText("")
 

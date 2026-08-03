@@ -29,6 +29,7 @@ from core.parser import collect_json_files, load_song_json
 from ui.widgets import (
     BatchProgressPanel,
     DragLineEdit,
+    PathLoader,
     ScrollableMessageBox,
     create_compact_combo,
     create_offset_spinbox,
@@ -57,11 +58,13 @@ class SectionExportResult:
 
 
 class SectionExportWorker(QThread):
-    progress = pyqtSignal(int, str)
+    progress = pyqtSignal(float, str)
+    scan_progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)
 
     def __init__(self, input_path, output_dir, lyric_field, title_lang, artist_lang,
-                 time_offset_ms, audio_reference_calibration, parent=None):
+                 time_offset_ms, audio_reference_calibration, parent=None,
+                 json_paths: list | None = None):
         super().__init__(parent)
         self.input_path = input_path
         self.output_dir = output_dir
@@ -70,13 +73,27 @@ class SectionExportWorker(QThread):
         self.artist_lang = artist_lang
         self.time_offset_ms = time_offset_ms
         self.audio_reference_calibration = audio_reference_calibration
+        self.json_paths = json_paths
+
+    def _emit_scan_progress(self, index: int, total: int, name: str) -> None:
+        """按整百分比节流，避免上万文件时信号过密。"""
+        if index == total or int(index / total * 10000) != int((index - 1) / total * 10000):
+            self.scan_progress.emit(index, total)
 
     def run(self):
         from core.parser import collect_json_files
 
-        self.progress.emit(0, "正在扫描 JSON 文件…")
         try:
-            json_paths = collect_json_files(self.input_path, valid_only=True)
+            if self.json_paths is not None:
+                # 拖入路径时已预载入完成，直接复用扫描结果
+                json_paths = self.json_paths
+            else:
+                self.progress.emit(0, "正在扫描 JSON 文件…")
+                json_paths = collect_json_files(
+                    self.input_path,
+                    valid_only=True,
+                    progress_callback=self._emit_scan_progress,
+                )
             if not json_paths:
                 self.finished.emit(SectionExportResult(error="未找到有效 JSON"))
                 return
@@ -84,7 +101,7 @@ class SectionExportWorker(QThread):
             all_rows = []
             for index, path in enumerate(json_paths, start=1):
                 name = os.path.basename(path)
-                self.progress.emit(int(index / total * 100), f"正在处理: {name}")
+                self.progress.emit(index / total * 100, f"正在处理: {name}")
                 song = load_song_json(path, self.lyric_field)
                 all_rows.extend(
                     collect_section_export_rows(
@@ -100,12 +117,14 @@ class SectionExportWorker(QThread):
 
 
 class LyricExportWorker(QThread):
-    progress = pyqtSignal(int, str)
+    progress = pyqtSignal(float, str)
+    scan_progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)
 
     def __init__(self, input_path, output_dir, lyric_field, lyric_format, part,
                  title_lang, artist_lang, ksc_options, time_offset_ms,
-                 audio_reference_calibration, parent=None):
+                 audio_reference_calibration, parent=None,
+                 json_paths: list | None = None):
         super().__init__(parent)
         self.input_path = input_path
         self.output_dir = output_dir
@@ -117,12 +136,26 @@ class LyricExportWorker(QThread):
         self.ksc_options = ksc_options
         self.time_offset_ms = time_offset_ms
         self.audio_reference_calibration = audio_reference_calibration
+        self.json_paths = json_paths
+
+    def _emit_scan_progress(self, index: int, total: int, name: str) -> None:
+        """按整百分比节流，避免上万文件时信号过密。"""
+        if index == total or int(index / total * 10000) != int((index - 1) / total * 10000):
+            self.scan_progress.emit(index, total)
 
     def run(self):
         from core.parser import collect_json_files
 
-        self.progress.emit(0, "正在扫描 JSON 文件…")
-        json_paths = collect_json_files(self.input_path, valid_only=True)
+        if self.json_paths is not None:
+            # 拖入路径时已预载入完成，直接复用扫描结果
+            json_paths = self.json_paths
+        else:
+            self.progress.emit(0, "正在扫描 JSON 文件…")
+            json_paths = collect_json_files(
+                self.input_path,
+                valid_only=True,
+                progress_callback=self._emit_scan_progress,
+            )
 
         result = LyricExportResult(success=[], failed=[], calibration_notes=[])
         if not json_paths:
@@ -132,7 +165,7 @@ class LyricExportWorker(QThread):
 
         for index, path in enumerate(json_paths, start=1):
             name = os.path.basename(path)
-            self.progress.emit(int(index / total * 100), f"正在处理: {name}")
+            self.progress.emit(index / total * 100, f"正在处理: {name}")
             try:
                 song = load_song_json(path, self.lyric_field)
                 calibration_log: list[str] = []
@@ -289,6 +322,70 @@ class LyricExportPage(ScrollArea):
         self.section_worker: SectionExportWorker | None = None
         self._update_ksc_option_visibility()
 
+        # 拖入/输入路径后立即后台载入（扫描校验 JSON），点击开始时直接复用结果
+        self._path_loader: PathLoader | None = None
+        self._loaded_result: tuple[str, list] | None = None
+        self._pending_start = False
+        self._pending_launcher = None
+        self._pending_params: dict | None = None
+        self.input_edit.textChanged.connect(self._on_input_path_changed)
+
+    def _scan_loader(self, path, *, progress_callback=None, cancel_check=None):
+        from core.parser import collect_json_files
+
+        return collect_json_files(
+            path,
+            valid_only=True,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def _on_input_path_changed(self, path: str):
+        path = (path or "").strip()
+        # 路径变化时取消待启动任务（等待加载中重新拖入新目录需重新点击开始）
+        self._pending_start = False
+        self._pending_launcher = None
+        self._pending_params = None
+        if self._path_loader is not None and self._path_loader.isRunning():
+            self._path_loader.cancel()
+        self._path_loader = None
+        self._loaded_result = None
+        if not path or not os.path.exists(path):
+            self.input_edit.set_scan_progress(None)
+            return
+        # 载入过程中重新拖入新目录：取消旧载入并重新触发
+        self.input_edit.set_scan_progress(0)
+        loader = PathLoader(path, self._scan_loader, self)
+        loader.scan_progress.connect(self._on_scan_progress)
+        loader.finished.connect(self._on_path_loaded)
+        self._path_loader = loader
+        loader.start()
+
+    def _on_path_loaded(self, payload):
+        path, result, error = payload
+        self._path_loader = None
+        if path != self.input_edit.text().strip():
+            return  # 载入期间路径已变化，丢弃过期结果
+        self.input_edit.set_scan_progress(None)
+        if error:
+            self._loaded_result = None
+        else:
+            self._loaded_result = (path, result)
+        if self._pending_start:
+            # 点击开始时预载入未完成：载入结束后自动启动任务
+            self._pending_start = False
+            launcher = self._pending_launcher
+            params = self._pending_params
+            self._pending_launcher = None
+            self._pending_params = None
+            launcher(**params)
+
+    def _loaded_json_paths(self, input_path: str) -> list | None:
+        """返回与当前输入路径匹配的预扫描结果，无则 None。"""
+        if self._loaded_result is not None and self._loaded_result[0] == input_path:
+            return self._loaded_result[1]
+        return None
+
     def _current_lyric_format(self) -> str:
         return LYRIC_FORMAT_LABELS[self.format_combo.currentIndex()][1]
 
@@ -375,12 +472,7 @@ class LyricExportPage(ScrollArea):
         time_offset_ms = self.offset_spinbox.value()
         audio_reference_calibration = self.audio_calibration_checkbox.isChecked()
 
-        self._set_export_buttons_enabled(False)
-        self._lock_params()
-        self.progress_panel.start("正在扫描 JSON 文件…")
-        InfoBar.info("开始导出段落信息", "正在扫描 JSON 文件，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
-
-        self.section_worker = SectionExportWorker(
+        params = dict(
             input_path=input_path,
             output_dir=output_dir,
             lyric_field=lyric_field,
@@ -389,16 +481,56 @@ class LyricExportPage(ScrollArea):
             time_offset_ms=time_offset_ms,
             audio_reference_calibration=audio_reference_calibration,
         )
+        if self._path_loader is not None and self._path_loader.isRunning():
+            # 预载入尚未完成：等待其结束再启动，避免二次加载导致进度跳回
+            self._pending_start = True
+            self._pending_launcher = self._launch_section_worker
+            self._pending_params = params
+            self._set_export_buttons_enabled(False)
+            self._lock_params()
+            self.progress_panel.start("等待加载JSON中 0%")
+            return
+
+        self._launch_section_worker(**params)
+
+    def _launch_section_worker(self, **params):
+        input_path = params["input_path"]
+        self._set_export_buttons_enabled(False)
+        self._lock_params()
+        self.progress_panel.start("正在扫描 JSON 文件…")
+        InfoBar.info("开始导出段落信息", "正在扫描 JSON 文件，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+
+        self.section_worker = SectionExportWorker(
+            input_path=input_path,
+            output_dir=params["output_dir"],
+            lyric_field=params["lyric_field"],
+            title_lang=params["title_lang"],
+            artist_lang=params["artist_lang"],
+            time_offset_ms=params["time_offset_ms"],
+            audio_reference_calibration=params["audio_reference_calibration"],
+            json_paths=self._loaded_json_paths(input_path),
+        )
         self.section_worker.progress.connect(self._on_section_progress)
+        self.section_worker.scan_progress.connect(self._on_scan_progress)
         self.section_worker.finished.connect(self._on_section_finished)
         self.section_worker.start()
 
+    def _on_scan_progress(self, index: int, total: int) -> None:
+        value = index / total * 100 if total else 100.0
+        self.input_edit.set_scan_progress(value)
+        if getattr(self, "_pending_start", False):
+            # 等待加载阶段：主进度条保持不动，仅状态文字同步百分比
+            self.progress_panel.status_label.setText(f"等待加载JSON中 {value:.2f}%")
+
     def _on_section_progress(self, value: int, message: str):
+        # 进入逐曲处理阶段，隐藏扫描进度圈
+        self.input_edit.set_scan_progress(None)
         self.progress_panel.update(value, message)
 
     def _on_section_finished(self, result: SectionExportResult):
         self._set_export_buttons_enabled(True)
         self._unlock_params()
+        self.input_edit.set_scan_progress(None)
 
         if result.error:
             ScrollableMessageBox("导出失败", result.error, self.window()).exec()
@@ -427,12 +559,7 @@ class LyricExportPage(ScrollArea):
         time_offset_ms = self.offset_spinbox.value()
         audio_reference_calibration = self.audio_calibration_checkbox.isChecked()
 
-        self._set_export_buttons_enabled(False)
-        self._lock_params()
-        self.progress_panel.start("正在扫描 JSON 文件…")
-        InfoBar.info("开始导出", "正在扫描 JSON 文件，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
-
-        self.worker = LyricExportWorker(
+        params = dict(
             input_path=input_path,
             output_dir=output_dir,
             lyric_field=lyric_field,
@@ -444,16 +571,52 @@ class LyricExportPage(ScrollArea):
             time_offset_ms=time_offset_ms,
             audio_reference_calibration=audio_reference_calibration,
         )
+        if self._path_loader is not None and self._path_loader.isRunning():
+            # 预载入尚未完成：等待其结束再启动，避免二次加载导致进度跳回
+            self._pending_start = True
+            self._pending_launcher = self._launch_worker
+            self._pending_params = params
+            self._set_export_buttons_enabled(False)
+            self._lock_params()
+            self.progress_panel.start("等待加载JSON中 0%")
+            return
+
+        self._launch_worker(**params)
+
+    def _launch_worker(self, **params):
+        input_path = params["input_path"]
+        self._set_export_buttons_enabled(False)
+        self._lock_params()
+        self.progress_panel.start("正在扫描 JSON 文件…")
+        InfoBar.info("开始导出", "正在扫描 JSON 文件，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
+
+        self.worker = LyricExportWorker(
+            input_path=input_path,
+            output_dir=params["output_dir"],
+            lyric_field=params["lyric_field"],
+            lyric_format=params["lyric_format"],
+            part=params["part"],
+            title_lang=params["title_lang"],
+            artist_lang=params["artist_lang"],
+            ksc_options=params["ksc_options"],
+            time_offset_ms=params["time_offset_ms"],
+            audio_reference_calibration=params["audio_reference_calibration"],
+            json_paths=self._loaded_json_paths(input_path),
+        )
         self.worker.progress.connect(self._on_progress)
+        self.worker.scan_progress.connect(self._on_scan_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
     def _on_progress(self, value: int, message: str):
+        # 进入逐曲处理阶段，隐藏扫描进度圈
+        self.input_edit.set_scan_progress(None)
         self.progress_panel.update(value, message)
 
     def _on_finished(self, result: LyricExportResult):
         self._set_export_buttons_enabled(True)
         self._unlock_params()
+        self.input_edit.set_scan_progress(None)
 
         if not result.success and not result.failed:
             ScrollableMessageBox(

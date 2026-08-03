@@ -27,6 +27,7 @@ from core.local_resolver import load_local_song_json
 from ui.widgets import (
     BatchProgressPanel,
     DragLineEdit,
+    PathLoader,
     ScrollableMessageBox,
     create_compact_combo,
     create_offset_spinbox,
@@ -49,12 +50,14 @@ class LocalMidiResult:
 
 
 class LocalMidiWorker(QThread):
-    progress = pyqtSignal(int, str)
+    progress = pyqtSignal(float, str)
+    scan_progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)
 
     def __init__(self, parent_dir, output_dir, part_mode, lyric_field, write_tempo, write_lyrics,
                  lyric_granularity, lower_octave, write_section_markers, exclude_rap_sections,
-                 remove_non_melody_notes, time_offset_ms, audio_reference_calibration, parent=None):
+                 remove_non_melody_notes, time_offset_ms, audio_reference_calibration, parent=None,
+                 bundles: list | None = None):
         super().__init__(parent)
         self.parent_dir = parent_dir
         self.output_dir = output_dir
@@ -69,19 +72,32 @@ class LocalMidiWorker(QThread):
         self.remove_non_melody_notes = remove_non_melody_notes
         self.time_offset_ms = time_offset_ms
         self.audio_reference_calibration = audio_reference_calibration
+        self.bundles = bundles
+
+    def _emit_scan_progress(self, index: int, total: int, name: str) -> None:
+        """按整百分比节流，避免子文件夹过多时信号过密。"""
+        if index == total or int(index / total * 10000) != int((index - 1) / total * 10000):
+            self.scan_progress.emit(index, total)
 
     def run(self):
-        self.progress.emit(0, "正在扫描母文件夹…")
-        try:
-            bundles = scan_local_parent_dir(self.parent_dir)
-        except ValueError as exc:
-            self.finished.emit(LocalMidiResult(success=[], failed=[(self.parent_dir, str(exc))], skipped=0, calibration_notes=[]))
-            return
+        if self.bundles is not None:
+            # 拖入路径时已预载入完成，直接复用扫描结果
+            bundles = self.bundles
+        else:
+            self.progress.emit(0, "正在扫描母文件夹…")
+            try:
+                bundles = scan_local_parent_dir(
+                    self.parent_dir,
+                    progress_callback=self._emit_scan_progress,
+                )
+            except ValueError as exc:
+                self.finished.emit(LocalMidiResult(success=[], failed=[(self.parent_dir, str(exc))], skipped=0, calibration_notes=[]))
+                return
         result = LocalMidiResult(success=[], failed=[], skipped=0, calibration_notes=[])
         total = len(bundles)
         for index, bundle in enumerate(bundles, start=1):
             name = os.path.basename(bundle.json_path)
-            self.progress.emit(int(index / total * 100), f"正在处理: {name}")
+            self.progress.emit(index / total * 100, f"正在处理: {name}")
             try:
                 song = load_local_song_json(bundle.json_path, self.lyric_field)
                 song = populate_song_data_with_locals(song, bundle)
@@ -241,6 +257,65 @@ class LocalMidiExportPage(ScrollArea):
 
         self.worker: LocalMidiWorker | None = None
 
+        # 拖入/输入路径后立即后台载入（扫描母文件夹），点击开始时直接复用结果
+        self._path_loader: PathLoader | None = None
+        self._loaded_result: tuple[str, list] | None = None
+        self._pending_start = False
+        self._pending_params: dict | None = None
+        self.input_edit.textChanged.connect(self._on_input_path_changed)
+
+    def _scan_loader(self, path, *, progress_callback=None, cancel_check=None):
+        from core.local_resolver import scan_local_parent_dir
+
+        return scan_local_parent_dir(
+            path,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def _on_input_path_changed(self, path: str):
+        path = (path or "").strip()
+        # 路径变化时取消待启动任务（等待加载中重新拖入新目录需重新点击开始）
+        self._pending_start = False
+        self._pending_params = None
+        if self._path_loader is not None and self._path_loader.isRunning():
+            self._path_loader.cancel()
+        self._path_loader = None
+        self._loaded_result = None
+        if not path or not os.path.isdir(path):
+            self.input_edit.set_scan_progress(None)
+            return
+        # 载入过程中重新拖入新目录：取消旧载入并重新触发
+        self.input_edit.set_scan_progress(0)
+        loader = PathLoader(path, self._scan_loader, self)
+        loader.scan_progress.connect(self._on_scan_progress)
+        loader.finished.connect(self._on_path_loaded)
+        self._path_loader = loader
+        loader.start()
+
+    def _on_path_loaded(self, payload):
+        path, result, error = payload
+        self._path_loader = None
+        if path != self.input_edit.text().strip():
+            return  # 载入期间路径已变化，丢弃过期结果
+        self.input_edit.set_scan_progress(None)
+        if error:
+            self._loaded_result = None
+        else:
+            self._loaded_result = (path, result)
+        if self._pending_start:
+            # 点击开始时预载入未完成：载入结束后自动启动任务
+            self._pending_start = False
+            params = self._pending_params
+            self._pending_params = None
+            self._launch_worker(**params)
+
+    def _loaded_bundles(self, input_path: str) -> list | None:
+        """返回与当前输入路径匹配的预扫描结果，无则 None。"""
+        if self._loaded_result is not None and self._loaded_result[0] == input_path:
+            return self._loaded_result[1]
+        return None
+
     def _update_lyric_option_visibility(self, checked: bool):
         self.lyric_options_widget.setVisible(checked)
 
@@ -315,26 +390,69 @@ class LocalMidiExportPage(ScrollArea):
         time_offset_ms = self.offset_spinbox.value()
         audio_calibration = self.audio_calibration_checkbox.isChecked()
 
+        params = dict(
+            parent_dir=parent_dir,
+            output_dir=output_dir,
+            part_mode=part_mode,
+            lyric_field=lyric_field,
+            write_tempo=write_tempo,
+            write_lyrics=write_lyrics,
+            lyric_granularity=lyric_granularity,
+            lower_octave=lower_octave,
+            write_section_markers=write_section_markers,
+            exclude_rap_sections=exclude_rap_sections,
+            remove_non_melody_notes=remove_non_melody_notes,
+            time_offset_ms=time_offset_ms,
+            audio_calibration=audio_calibration,
+        )
+        if self._path_loader is not None and self._path_loader.isRunning():
+            # 预载入尚未完成：等待其结束再启动，避免二次加载导致进度跳回
+            self._pending_start = True
+            self._pending_params = params
+            self.export_btn.setEnabled(False)
+            self._lock_params()
+            self.progress_panel.start("等待加载JSON中 0%")
+            return
+
+        self._launch_worker(**params)
+
+    def _launch_worker(self, **params):
+        parent_dir = params["parent_dir"]
         self.export_btn.setEnabled(False)
         self._lock_params()
         self.progress_panel.start("正在扫描母文件夹…")
         InfoBar.info("开始导出", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
         self.worker = LocalMidiWorker(
-            bundles, output_dir, part_mode, lyric_field, write_tempo, write_lyrics,
-            lyric_granularity, lower_octave, write_section_markers, exclude_rap_sections,
-            remove_non_melody_notes, time_offset_ms, audio_calibration,
+            parent_dir, params["output_dir"], params["part_mode"], params["lyric_field"],
+            params["write_tempo"], params["write_lyrics"],
+            params["lyric_granularity"], params["lower_octave"],
+            params["write_section_markers"], params["exclude_rap_sections"],
+            params["remove_non_melody_notes"], params["time_offset_ms"],
+            params["audio_calibration"],
+            bundles=self._loaded_bundles(parent_dir),
         )
         self.worker.progress.connect(self._on_progress)
+        self.worker.scan_progress.connect(self._on_scan_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
+    def _on_scan_progress(self, index: int, total: int) -> None:
+        value = index / total * 100 if total else 100.0
+        self.input_edit.set_scan_progress(value)
+        if getattr(self, "_pending_start", False):
+            # 等待加载阶段：主进度条保持不动，仅状态文字同步百分比
+            self.progress_panel.status_label.setText(f"等待加载JSON中 {value:.2f}%")
+
     def _on_progress(self, value: int, message: str):
+        # 进入逐曲处理阶段，隐藏扫描进度圈
+        self.input_edit.set_scan_progress(None)
         self.progress_panel.update(value, message)
 
     def _on_finished(self, result: LocalMidiResult):
         self.export_btn.setEnabled(True)
         self._unlock_params()
+        self.input_edit.set_scan_progress(None)
         self.progress_panel.finish()
         if result.success and not result.failed:
             detail = f"成功导出 {len(result.success)} 个 MIDI 文件。"

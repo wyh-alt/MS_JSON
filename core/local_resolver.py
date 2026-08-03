@@ -10,7 +10,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import json as _json
 import tempfile
@@ -249,7 +249,12 @@ def _find_json_by_msid(subfolder: str, expected_msid: int) -> str | None:
     return all_json[0]
 
 
-def scan_local_parent_dir(parent_dir: str) -> list[LocalSongBundle]:
+def scan_local_parent_dir(
+    parent_dir: str,
+    *,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[LocalSongBundle]:
     """扫描母文件夹，返回所有有效 MSID 子文件夹资源包。
 
     每个子文件夹应包含：
@@ -258,6 +263,8 @@ def scan_local_parent_dir(parent_dir: str) -> list[LocalSongBundle]:
     - 零个或一个封面图片
 
     忽略以 . 开头的文件和文件夹。
+    progress_callback(index, total, name) 在每个子文件夹读取时回调，用于展示扫描进度；
+    cancel_check() 返回 True 时中断扫描（用于路径变更后取消旧载入）。
     """
     parent = os.path.abspath(parent_dir)
     if not os.path.isdir(parent):
@@ -269,12 +276,18 @@ def scan_local_parent_dir(parent_dir: str) -> list[LocalSongBundle]:
     except OSError as exc:
         raise ValueError(f"无法读取母文件夹: {parent} ({exc})") from exc
 
-    for name in entries:
-        if _is_hidden(name):
-            continue
+    candidates = [
+        name
+        for name in entries
+        if not _is_hidden(name) and os.path.isdir(os.path.join(parent, name))
+    ]
+    total = len(candidates)
+    for index, name in enumerate(candidates, start=1):
+        if cancel_check is not None and cancel_check():
+            break
+        if progress_callback is not None:
+            progress_callback(index, total, name)
         subfolder = os.path.join(parent, name)
-        if not os.path.isdir(subfolder):
-            continue
 
         # 尝试从文件夹名提取 msid
         msid = _extract_msid_from_folder(name)

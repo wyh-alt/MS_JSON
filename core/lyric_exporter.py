@@ -433,11 +433,11 @@ def write_sections_excel(
         raise ValueError("没有可导出的段落信息")
 
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "段落信息.xlsx")
+    output_path = os.path.join(output_dir, "歌词段落信息及时间点.xlsx")
 
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "段落信息"
+    sheet.title = "歌词段落信息及时间点"
     sheet.append(list(SECTION_EXPORT_HEADERS))
     for cell in sheet[1]:
         cell.font = Font(bold=True)

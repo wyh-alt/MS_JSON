@@ -303,6 +303,30 @@ def write_metadata_excel(rows: list[list[str]], output_dir: str) -> str:
     return output_path
 
 
+def cache_metadata_excel(excel_path: str, json_paths: list[str]) -> None:
+    """把生成的 Excel 复制到各 JSON 原目录的共用缓存（.ms_json_audio_cache/）。
+
+    与音频资源同缓存语义：按 JSON 父目录去重，每个目录的缓存中留存一份
+    同名 Excel（覆盖旧副本），便于音频校准等模块直接复用；
+    复制失败不影响主流程，静默跳过。
+    """
+    source = Path(excel_path)
+    if not source.is_file():
+        return
+    seen_parents: set[str] = set()
+    for path in json_paths:
+        parent = str(Path(path).parent)
+        if parent in seen_parents:
+            continue
+        seen_parents.add(parent)
+        try:
+            cache_dir = Path(parent) / CACHE_DIR_NAME
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, cache_dir / METADATA_EXCEL_NAME)
+        except OSError:
+            pass
+
+
 MULTILANG_LYRIC_FIELDS = ("ko", "rom", "en")
 
 
@@ -432,6 +456,8 @@ def export_songs_metadata(
     ]
 
     excel_path = write_metadata_excel(rows, output_dir)
+    # 在各 JSON 原目录的共用缓存中留存一份，供其他模块复用
+    cache_metadata_excel(excel_path, json_paths)
     return MetadataExportResult(
         excel_path=excel_path,
         success_count=len(rows),

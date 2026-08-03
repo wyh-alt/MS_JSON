@@ -341,16 +341,6 @@ class ExportPage(ScrollArea):
         self.lyric_options_widget.setVisible(checked)
 
     def _browse_input(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择 JSON 文件",
-            "",
-            "JSON Files (*.json);;All Files (*)",
-        )
-        if path:
-            self.input_edit.setText(path)
-            return
-
         folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
         if folder:
             self.input_edit.setText(folder)
@@ -558,6 +548,12 @@ class MainWindow(FluentWindow):
         self.metadata_export_page = MetadataExportPage(self)
         self.metadata_export_page.setObjectName("metadataExportInterface")
         self.addSubInterface(self.metadata_export_page, FIF.INFO, "元数据提取")
+
+        from ui.delivery_export_page import DeliveryExportPage
+
+        self.delivery_export_page = DeliveryExportPage(self)
+        self.delivery_export_page.setObjectName("deliveryExportInterface")
+        self.addSubInterface(self.delivery_export_page, FIF.CERTIFICATE, "交付资源提取")
 
         from ui.audio_download_page import AudioDownloadPage
 

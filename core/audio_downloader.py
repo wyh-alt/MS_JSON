@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -21,6 +22,10 @@ _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 # JSON 原目录下的共用资源缓存：元数据提取、音频下载、音频校准等模块共用
 CACHE_DIR_NAME = ".ms_json_audio_cache"
+
+# 多模块并行时（如交付资源一键提取）可能并发下载同一 URL，
+# .part 临时文件 + os.replace 需串行化避免竞态
+_DOWNLOAD_LOCK = threading.Lock()
 
 # 第一遍只用来测量，LRA 取多少都不影响 measured_* 结果
 _MEASURE_LRA = 11.0
@@ -255,23 +260,28 @@ def download_cached_file(url: str, json_path: str, default_suffix: str = ".m4a")
     if cache_path.is_file() and cache_path.stat().st_size > 0:
         return cache_path
 
-    temp_path = cache_path.with_suffix(cache_path.suffix + ".part")
-    try:
-        request = urllib.request.Request(url, headers={"User-Agent": "MS_json/1.0"})
-        with urllib.request.urlopen(request, timeout=120) as response:
-            data = response.read()
-        if not data:
-            raise ValueError("下载的文件为空")
-        temp_path.write_bytes(data)
-        os.replace(temp_path, cache_path)
-    except urllib.error.URLError as exc:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise FileNotFoundError(f"下载失败: {url} ({exc})") from exc
-    except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
+    # 并发调用方可能同时下载同一 URL，串行化下载与落盘避免 .part 竞态
+    with _DOWNLOAD_LOCK:
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path  # 等待锁期间其他线程已完成下载
+
+        temp_path = cache_path.with_suffix(cache_path.suffix + ".part")
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "MS_json/1.0"})
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = response.read()
+            if not data:
+                raise ValueError("下载的文件为空")
+            temp_path.write_bytes(data)
+            os.replace(temp_path, cache_path)
+        except urllib.error.URLError as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise FileNotFoundError(f"下载失败: {url} ({exc})") from exc
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise
 
     return cache_path
 

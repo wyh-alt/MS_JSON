@@ -413,15 +413,6 @@ class AudioDownloadPage(ScrollArea):
         self.m4a_codec_combo.setVisible(show_m4a_options)
 
     def _browse_input(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择 JSON 文件",
-            "",
-            "JSON Files (*.json);;All Files (*)",
-        )
-        if path:
-            self.input_edit.setText(path)
-            return
         folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
         if folder:
             self.input_edit.setText(folder)

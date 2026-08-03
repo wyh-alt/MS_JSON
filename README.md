@@ -47,16 +47,29 @@ build.bat
 
 ## 应用功能
 
-主窗口包含四个页面（侧边栏自上而下）：
+主窗口包含五个页面（侧边栏自上而下）：
 
 | 页面 | 功能 |
 |------|------|
 | 元数据提取 | 汇总曲目信息 Excel，并按类型下载封面、旋律、伴奏、鼓轨 |
+| 交付资源提取 | 一键并行导出合成伴奏、MIDI、歌词、段落信息与交付总表 |
 | 音频下载 | 按 JSON 直链下载 MR 资源，ffmpeg 混音 / 转码 |
 | 歌词导出 | 导出 KSC / LRC / TXT / CSV 歌词及段落信息 Excel |
 | MIDI 导出 | 导出 KTV 风格 Type 1 MIDI |
 
-各模块共享 JSON 同目录下 `.ms_json_audio_cache/` 资源缓存：元数据提取下载的全部直链资源（含封面）都会先落缓存再拷贝到输出目录，后续音频下载、音频校准等模块直接复用，跳过重复下载。
+各模块共享 JSON 同目录下 `.ms_json_audio_cache/` 资源缓存：元数据提取下载的全部直链资源（含封面）都会先落缓存再拷贝到输出目录，后续音频下载、音频校准等模块直接复用，跳过重复下载。生成的 `曲目元数据.xlsx` 也会按 JSON 目录留存一份到该缓存，供其他模块复用。
+
+### 交付资源提取
+
+勾选需要处理的内容（伴奏处理 / MIDI处理 / 歌词处理 / 段落信息导出 / 交付总表导出，默认全选），输入 JSON 文件夹后一键并行执行，全部使用各模块默认参数：
+
+- **伴奏处理**：合并伴奏（harmony+drum）按音频下载模块默认参数导出 WAV（响度 -12 LUFS、限幅 -1 dBTP、分轨电平 -6 dB 均开启），存放至 `合成伴奏/` 子文件夹。
+- **MIDI处理**：按 MIDI 导出模块默认参数导出 `.mid`，存放至 `MIDI处理/` 子文件夹。
+- **歌词处理**：按歌词导出模块默认参数导出原歌词（ksc-txt），存放至 `歌词处理/` 子文件夹。
+- **段落信息导出**：生成 `歌词段落信息及时间点.xlsx`，直接放输出目录。
+- **交付总表导出**：生成 `资源产出交付总表.xlsx`，直接放输出目录；若 JSON 目录缓存中已有 `曲目元数据.xlsx` 且其 MSID 集合完整覆盖本次输入，则直接拷贝复用，否则重新提取（不下载直链资源、不导歌词）。
+
+各处理项目并行执行（最多 5 个并发，单曲目失败不影响其他项目与曲目）；全部结束后弹出处理日志框，逐项目显示成功 / 校准说明 / 失败明细与输出文件，可一键导出日志文本。
 
 下载类批量任务（元数据提取、音频下载）采用两轮处理：第一轮遇到链接超时等失败会跳过继续处理后面的任务；全部处理完后对失败任务（含资源下载失败但整首成功的）自动兜底重试一次，利用缓存只重新下载失败资源；重试后仍失败的任务在完成弹窗中逐一列举。
 
@@ -211,6 +224,26 @@ MIDI 导出、歌词导出、段落导出均可独立开关「音频参考校准
 - 中文子文件夹：`专辑封面`、`男调旋律`、`女调旋律`、`男调伴奏`、`女调伴奏`、`鼓轨`、`男调鼓轨`、`女调鼓轨`。
 - 封面按文件头魔数识别真实格式（URL 无后缀时也能保存为 `.jpg` 等）。
 - 全部直链资源（音频与封面）先下载到 JSON 同目录 `.ms_json_audio_cache/` 缓存，再拷贝到输出子文件夹重命名；音频下载 / 音频校准等模块可直接复用该缓存。
+- 生成的 `曲目元数据.xlsx` 同时按 JSON 父目录去重留存一份到各 `.ms_json_audio_cache/`，供交付资源提取等模块复用。
+
+---
+
+### `core/delivery_exporter.py` — 交付资源一键提取
+
+**职责**：按勾选项目并行执行伴奏 / MIDI / 歌词 / 段落 / 交付总表导出，统一进度聚合与结果收集。
+
+**并行编排**
+
+- `run_delivery_export()` 用 `ThreadPoolExecutor`（最多 5 个工作线程）并行运行勾选的处理项目，每个项目内部串行处理全部 JSON。
+- 各项目进度经 `_ProgressAggregator` 加权聚合为单一进度（百分比 + `[项目名] 状态` 文案），线程安全。
+- 单个项目的整体异常降级为该项目的失败记录，不影响其他项目。
+
+**交付总表缓存复用**
+
+- `_collect_mr_ids()` 轻量提取输入 JSON 的 `mr_id` 集合。
+- `_read_cached_metadata_msids()` / `_find_reusable_cache_table()` 按 JSON 父目录去重检查 `.ms_json_audio_cache/曲目元数据.xlsx`：任一缓存表 MSID 集合覆盖全部输入则直接拷贝重命名为 `资源产出交付总表.xlsx`；否则调用 `export_songs_metadata()` 重新提取（`download_resources=False`、`export_lyrics=False`，仅输出表格并自动刷新缓存副本）。
+
+**并发安全**：`audio_downloader.download_cached_file()` 与 `audio_calibration._ensure_pcm_wav()` 均加了模块级 / 按缓存路径的锁，并行项目对同一 URL 或同一 PCM 缓存的并发写入以串行化 + 二次检查保证原子落盘。
 
 ---
 
@@ -219,6 +252,7 @@ MIDI 导出、歌词导出、段落导出均可独立开关「音频参考校准
 | 文件 | 说明 |
 |------|------|
 | `main_window.py` | 主窗口与导航；内嵌 `ExportPage`（MIDI 导出页）及后台 `ExportWorker` |
+| `delivery_export_page.py` | 交付资源一键提取页（勾选项目、并行任务、日志弹窗） |
 | `audio_download_page.py` | 音频下载参数与批量任务 |
 | `metadata_export_page.py` | 元数据提取页 |
 | `lyric_export_page.py` | 歌词导出、段落 Excel、校准选项 |
@@ -256,9 +290,11 @@ MS_json/
 │   ├── lyric_exporter.py   # 歌词与段落 Excel
 │   ├── audio_calibration.py# 音频参考校准
 │   ├── audio_downloader.py # MR 音频下载与混音
-│   └── metadata_exporter.py# 元数据 Excel 与资源下载
+│   ├── metadata_exporter.py# 元数据 Excel 与资源下载
+│   └── delivery_exporter.py# 交付资源一键提取（并行编排与缓存复用）
 ├── ui/
 │   ├── main_window.py      # 主窗口 + MIDI 导出页
+│   ├── delivery_export_page.py
 │   ├── audio_download_page.py
 │   ├── metadata_export_page.py
 │   ├── lyric_export_page.py

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,11 @@ SLOW_ATTACK_RATIOS = (0.30, 0.50, 0.65)
 MIDI_MATCH_GAP_MS = 4_000
 ALIGN_TOLERANCE_MS = 60
 TARGET_SAMPLE_RATE = 22050
+
+# 多模块并行（如交付资源一键提取）可能对同一音频同时校准，
+# PCM 转换的 .part.wav + os.replace 按缓存路径串行化避免竞态
+_PCM_WAV_LOCKS: dict[str, threading.Lock] = {}
+_PCM_WAV_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -296,38 +302,46 @@ def _ensure_pcm_wav(audio_path: Path) -> Path:
         if wav_cache.stat().st_mtime >= audio_path.stat().st_mtime:
             return wav_cache
 
-    ffmpeg = find_ffmpeg_executable()
-    if ffmpeg is None:
-        return audio_path
+    with _PCM_WAV_LOCKS_GUARD:
+        lock = _PCM_WAV_LOCKS.setdefault(str(wav_cache), threading.Lock())
+    with lock:
+        # 等待锁期间其他线程可能已完成转换，二次检查
+        if wav_cache.is_file() and wav_cache.stat().st_size > 0:
+            if wav_cache.stat().st_mtime >= audio_path.stat().st_mtime:
+                return wav_cache
 
-    temp_path = wav_cache.with_suffix(".part.wav")
-    try:
-        subprocess.run(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(audio_path),
-                "-ac",
-                "1",
-                "-ar",
-                str(TARGET_SAMPLE_RATE),
-                "-c:a",
-                "pcm_s16le",
-                str(temp_path),
-            ],
-            check=True,
-            capture_output=True,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-        os.replace(temp_path, wav_cache)
-    except subprocess.CalledProcessError as exc:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"ffmpeg 解码失败: {stderr or exc}") from exc
+        ffmpeg = find_ffmpeg_executable()
+        if ffmpeg is None:
+            return audio_path
+
+        temp_path = wav_cache.with_suffix(".part.wav")
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(audio_path),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    str(TARGET_SAMPLE_RATE),
+                    "-c:a",
+                    "pcm_s16le",
+                    str(temp_path),
+                ],
+                check=True,
+                capture_output=True,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            os.replace(temp_path, wav_cache)
+        except subprocess.CalledProcessError as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg 解码失败: {stderr or exc}") from exc
 
     return wav_cache

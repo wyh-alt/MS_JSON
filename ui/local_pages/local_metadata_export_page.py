@@ -25,6 +25,7 @@ from core.local_resolver import (
 )
 from core.metadata_exporter import (
     build_metadata_row,
+    cache_metadata_excel,
     is_valid_ms_json,
     write_metadata_excel,
 )
@@ -153,6 +154,8 @@ class LocalMetadataWorker(QThread):
                 raise ValueError("没有成功提取的曲目元数据")
 
             excel_path = write_metadata_excel(rows, self.output_dir)
+            # 在各 JSON 原目录的共用缓存中留存一份，供其他模块复用
+            cache_metadata_excel(excel_path, [b.json_path for b in bundles])
             self.finished.emit(
                 LocalMetadataResult(
                     excel_path=excel_path,

@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
     CardWidget,
+    CheckBox,
     InfoBar,
     InfoBarPosition,
     PrimaryPushButton,
@@ -55,16 +56,38 @@ class LocalMetadataWorker(QThread):
     finished = pyqtSignal(object)
 
     def __init__(self, parent_dir: str, output_dir: str, parent=None,
-                 bundles: list | None = None):
+                 bundles: list | None = None, export_lyrics: bool = False):
         super().__init__(parent)
         self.parent_dir = parent_dir
         self.output_dir = output_dir
         self.bundles = bundles
+        self.export_lyrics = export_lyrics
 
     def _emit_scan_progress(self, index: int, total: int, name: str) -> None:
         """按整百分比节流，避免子文件夹过多时信号过密。"""
         if index == total or int(index / total * 10000) != int((index - 1) / total * 10000):
             self.scan_progress.emit(index, total)
+
+    def _export_local_multilang_lyrics(self, bundle, output_path) -> None:
+        """按歌词导出模块默认设置导出多语言歌词（使用本地音频校准）。"""
+        from core.local_resolver import populate_song_data_with_locals
+        from core.lyric_exporter import export_song_multilang_lyrics
+        from core.metadata_exporter import MULTILANG_LYRIC_FIELDS
+
+        songs: dict = {}
+        for field in MULTILANG_LYRIC_FIELDS:
+            song = load_local_song_json(bundle.json_path, lyric_field=field)
+            songs[field] = populate_song_data_with_locals(song, bundle)
+        export_song_multilang_lyrics(
+            songs,
+            str(output_path / "歌词"),
+            lyric_fields=MULTILANG_LYRIC_FIELDS,
+            lyric_format="ksc-txt",
+            part="all",
+            title_lang="origin",
+            artist_lang="origin",
+            audio_reference_calibration=True,
+        )
 
     def run(self):
         from core.parser import is_valid_ms_json as _is_valid
@@ -107,6 +130,12 @@ class LocalMetadataWorker(QThread):
                         output_dir=output_path,
                         download_resources=True,
                     )
+                    # 多语言歌词提取：本地资源处理完成后导出
+                    if self.export_lyrics:
+                        try:
+                            self._export_local_multilang_lyrics(bundle, output_path)
+                        except Exception as exc:
+                            row.download_errors.append(f"歌词导出: {exc}")
                     # 清除直链列（本地版本无 URL）
                     values = list(row.values)
                     for idx in _URL_COLUMN_INDICES:
@@ -174,6 +203,19 @@ class LocalMetadataExportPage(ScrollArea):
         input_row.addWidget(self.browse_input_btn)
         input_layout.addLayout(input_row)
         layout.addWidget(input_card)
+
+        # 提取选项
+        option_card = CardWidget(container)
+        option_layout = QVBoxLayout(option_card)
+        option_layout.addWidget(StrongBodyLabel("提取选项"))
+        self.lyrics_checkbox = CheckBox("多语言歌词提取", option_card)
+        self.lyrics_checkbox.setChecked(True)
+        self.lyrics_checkbox.setToolTip(
+            "按歌词导出模块默认设置导出音频校准后的韩文歌词、罗马音、英文翻译歌词，"
+            "存放至 歌词 子文件夹。"
+        )
+        option_layout.addWidget(self.lyrics_checkbox)
+        layout.addWidget(option_card)
 
         # 输出目录
         output_card = CardWidget(container)
@@ -292,6 +334,7 @@ class LocalMetadataExportPage(ScrollArea):
             self.browse_input_btn,
             self.output_edit,
             self.browse_output_btn,
+            self.lyrics_checkbox,
         ]
 
     def _lock_params(self) -> None:
@@ -312,8 +355,13 @@ class LocalMetadataExportPage(ScrollArea):
         if paths is None:
             return
         parent_dir, output_dir = paths
+        export_lyrics = self.lyrics_checkbox.isChecked()
 
-        params = dict(parent_dir=parent_dir, output_dir=output_dir)
+        params = dict(
+            parent_dir=parent_dir,
+            output_dir=output_dir,
+            export_lyrics=export_lyrics,
+        )
         if self._path_loader is not None and self._path_loader.isRunning():
             # 预载入尚未完成：等待其结束再启动，避免二次加载导致进度跳回
             self._pending_start = True
@@ -336,6 +384,7 @@ class LocalMetadataExportPage(ScrollArea):
             parent_dir,
             params["output_dir"],
             bundles=self._loaded_bundles(parent_dir),
+            export_lyrics=params["export_lyrics"],
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.scan_progress.connect(self._on_scan_progress)

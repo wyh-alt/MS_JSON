@@ -303,10 +303,37 @@ def write_metadata_excel(rows: list[list[str]], output_dir: str) -> str:
     return output_path
 
 
+MULTILANG_LYRIC_FIELDS = ("ko", "rom", "en")
+
+
+def _export_multilang_lyrics(json_path: str, output_dir: Path) -> None:
+    """以歌词导出模块默认设置导出韩文/罗马音/英文歌词，存入 歌词/ 子文件夹。
+
+    三种语言共享一次音频校准（校准音频命中缓存，不重复下载）；
+    命名与歌词导出模块一致（{mr_id}-{语言标签}.{扩展名}）。
+    """
+    from core.lyric_exporter import export_song_multilang_lyrics
+
+    songs: dict[str, SongData] = {}
+    for field in MULTILANG_LYRIC_FIELDS:
+        songs[field] = load_song_json(json_path, lyric_field=field)
+    export_song_multilang_lyrics(
+        songs,
+        str(output_dir / "歌词"),
+        lyric_fields=MULTILANG_LYRIC_FIELDS,
+        lyric_format="ksc-txt",
+        part="all",
+        title_lang="origin",
+        artist_lang="origin",
+        audio_reference_calibration=True,
+    )
+
+
 def _build_song_row(
     path: str,
     output_path: Path,
     download_resources: bool,
+    export_lyrics: bool = False,
 ) -> tuple[SongData, SongMetadataRow]:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -319,6 +346,12 @@ def _build_song_row(
         output_dir=output_path,
         download_resources=download_resources,
     )
+    # 缓存/资源下载完成后，按歌词导出模块默认设置导出多语言歌词
+    if export_lyrics:
+        try:
+            _export_multilang_lyrics(path, output_path)
+        except Exception as exc:
+            row.download_errors.append(f"歌词导出: {exc}")
     return song, row
 
 
@@ -327,6 +360,7 @@ def export_songs_metadata(
     output_dir: str,
     *,
     download_resources: bool = True,
+    export_lyrics: bool = False,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> MetadataExportResult:
     """批量提取元数据并下载直链资源。
@@ -335,6 +369,9 @@ def export_songs_metadata(
     全部处理完后，对失败任务（含整首失败与资源下载失败但整首成功）做一次兜底重试，
     利用缓存只重新下载失败资源；重试后仍失败的任务列入最终 failed，由调用方弹窗列举。
     重试轮的 progress_callback 任务名带“重试: ”前缀。
+
+    export_lyrics=True 时，在资源下载完成后按歌词导出模块默认设置，
+    导出音频校准后的韩文/罗马音/英文歌词到输出目录的 歌词/ 子文件夹。
     """
     output_path = Path(output_dir)
     # path -> (mr_id, row)，重试成功后覆盖第一轮结果，保持 json_paths 顺序输出
@@ -347,7 +384,9 @@ def export_songs_metadata(
         if progress_callback is not None:
             progress_callback(index, len(json_paths), name)
         try:
-            song, row = _build_song_row(path, output_path, download_resources)
+            song, row = _build_song_row(
+                path, output_path, download_resources, export_lyrics
+            )
             song_rows[path] = (song.mr_id, row)
         except Exception as exc:
             pending[path] = str(exc)
@@ -365,7 +404,9 @@ def export_songs_metadata(
         if progress_callback is not None:
             progress_callback(index, total_retry, f"重试: {name}")
         try:
-            song, row = _build_song_row(path, output_path, download_resources)
+            song, row = _build_song_row(
+                path, output_path, download_resources, export_lyrics
+            )
             song_rows[path] = (song.mr_id, row)
             pending.pop(path, None)
         except Exception as exc:

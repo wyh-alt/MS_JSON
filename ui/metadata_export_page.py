@@ -48,12 +48,14 @@ class MetadataExportWorker(QThread):
         download_resources: bool,
         parent=None,
         json_paths: list | None = None,
+        export_lyrics: bool = False,
     ):
         super().__init__(parent)
         self.input_path = input_path
         self.output_dir = output_dir
         self.download_resources = download_resources
         self.json_paths = json_paths
+        self.export_lyrics = export_lyrics
 
     def _emit_scan_progress(self, index: int, total: int, name: str) -> None:
         """按整百分比节流，避免上万文件时信号过密。"""
@@ -89,6 +91,7 @@ class MetadataExportWorker(QThread):
                 json_paths,
                 self.output_dir,
                 download_resources=self.download_resources,
+                export_lyrics=self.export_lyrics,
                 progress_callback=on_progress,
             )
             self.finished.emit(
@@ -142,12 +145,23 @@ class MetadataExportPage(ScrollArea):
         option_card = CardWidget(container)
         option_layout = QVBoxLayout(option_card)
         option_layout.addWidget(StrongBodyLabel("提取选项"))
+        checkbox_row = QHBoxLayout()
+        checkbox_row.setSpacing(12)
         self.download_checkbox = CheckBox("下载直链资源到子文件夹", option_card)
         self.download_checkbox.setChecked(True)
         self.download_checkbox.setToolTip(
             "将专辑封面、男调旋律、伴奏、鼓轨等直链分别保存到对应中文子文件夹。"
         )
-        option_layout.addWidget(self.download_checkbox)
+        checkbox_row.addWidget(self.download_checkbox)
+        self.lyrics_checkbox = CheckBox("多语言歌词提取", option_card)
+        self.lyrics_checkbox.setChecked(True)
+        self.lyrics_checkbox.setToolTip(
+            "缓存文件下载完成后，按歌词导出模块默认设置导出音频校准后的"
+            "韩文歌词、罗马音、英文翻译歌词，存放至 歌词 子文件夹。"
+        )
+        checkbox_row.addWidget(self.lyrics_checkbox)
+        checkbox_row.addStretch(1)
+        option_layout.addLayout(checkbox_row)
         layout.addWidget(option_card)
 
         output_card = CardWidget(container)
@@ -279,6 +293,7 @@ class MetadataExportPage(ScrollArea):
             self.output_edit,
             self.browse_output_btn,
             self.download_checkbox,
+            self.lyrics_checkbox,
         ]
 
     def _lock_params(self) -> None:
@@ -300,6 +315,7 @@ class MetadataExportPage(ScrollArea):
             return
         input_path, output_dir = paths
         download_resources = self.download_checkbox.isChecked()
+        export_lyrics = self.lyrics_checkbox.isChecked()
 
         if self._path_loader is not None and self._path_loader.isRunning():
             # 预载入尚未完成：等待其结束再启动，避免二次加载导致进度跳回
@@ -308,6 +324,7 @@ class MetadataExportPage(ScrollArea):
                 input_path=input_path,
                 output_dir=output_dir,
                 download_resources=download_resources,
+                export_lyrics=export_lyrics,
             )
             self.export_btn.setEnabled(False)
             self._lock_params()
@@ -318,6 +335,7 @@ class MetadataExportPage(ScrollArea):
             input_path=input_path,
             output_dir=output_dir,
             download_resources=download_resources,
+            export_lyrics=export_lyrics,
         )
 
     def _launch_worker(self, **params):
@@ -333,6 +351,7 @@ class MetadataExportPage(ScrollArea):
             output_dir=params["output_dir"],
             download_resources=params["download_resources"],
             json_paths=self._loaded_json_paths(input_path),
+            export_lyrics=params["export_lyrics"],
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.scan_progress.connect(self._on_scan_progress)

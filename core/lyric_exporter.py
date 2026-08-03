@@ -350,6 +350,69 @@ def export_song_lyrics(
     return output_path
 
 
+def export_song_multilang_lyrics(
+    songs: dict[str, SongData],
+    output_dir: str,
+    *,
+    lyric_fields: tuple[str, ...],
+    lyric_format: LyricFormat = "ksc-txt",
+    part: LyricPart = "all",
+    title_lang: str = "origin",
+    artist_lang: str = "origin",
+    ksc_options: KscOptions | None = None,
+    time_offset_ms: int = 0,
+    audio_reference_calibration: bool = True,
+    calibration_log: list[str] | None = None,
+) -> list[str]:
+    """按歌词导出模块默认设置导出多种语言歌词（共享一次音频校准）。
+
+    songs 为 {lyric_field: 已按该语言解析的 SongData}；三种语言使用同一校准偏移，
+    命名与歌词导出模块一致（{mr_id}-{语言标签}.{扩展名}），全部写入 output_dir。
+    """
+    if not songs:
+        return []
+
+    from core.audio_calibration import resolve_export_time_offset
+
+    base = next(iter(songs.values()))
+    total_offset_ms, calibration, calibration_error = resolve_export_time_offset(
+        base,
+        time_offset_ms=time_offset_ms,
+        audio_reference_calibration=audio_reference_calibration,
+    )
+    if calibration_log is not None:
+        from core.audio_calibration import append_calibration_log
+
+        append_calibration_log(
+            calibration_log,
+            audio_reference_calibration=audio_reference_calibration,
+            calibration=calibration,
+            calibration_error=calibration_error,
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    paths: list[str] = []
+    for field in lyric_fields:
+        song = songs.get(field)
+        if song is None:
+            continue
+        song = apply_song_time_offset(song, total_offset_ms)
+        content = render_lyrics(
+            song,
+            lyric_format=lyric_format,
+            part=part,
+            title_lang=title_lang,
+            artist_lang=artist_lang,
+            ksc_options=ksc_options,
+        )
+        filename = f"{_output_basename(song, field, part)}{_output_extension(lyric_format)}"
+        output_path = os.path.join(output_dir, filename)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        paths.append(output_path)
+    return paths
+
+
 SECTION_EXPORT_HEADERS = (
     "MSID",
     "歌名",

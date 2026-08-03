@@ -342,11 +342,7 @@ class LocalMidiExportPage(ScrollArea):
                 detail += "\n音频校准:\n" + "\n".join(
                     f"- {note}" for note in result.calibration_notes
                 )
-            if len(result.calibration_notes) > 5:
-                # 校准记录较多时用可滚动弹窗展示全部，便于核实
-                ScrollableMessageBox("导出完成", detail, self.window()).exec()
-            else:
-                InfoBar.success("导出完成", detail, duration=6000, parent=self.window(), position=InfoBarPosition.TOP)
+            ScrollableMessageBox("导出完成", detail, self.window()).exec()
             return
         lines = [f"成功: {len(result.success)} 个 MIDI 文件"]
         if result.calibration_notes:

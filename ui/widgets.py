@@ -1,7 +1,12 @@
+import os
+import re
+from datetime import datetime
+
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QVBoxLayout,
     QWidget,
@@ -11,8 +16,10 @@ from qfluentwidgets import (
     ComboBox,
     CompactSpinBox,
     LineEdit,
+    MessageBox,
     PrimaryPushButton,
     ProgressBar,
+    PushButton,
     StrongBodyLabel,
     TextBrowser,
     TransparentToolButton,
@@ -369,6 +376,10 @@ class ScrollableMessageBox(QDialog):
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
+        self.export_button = PushButton("导出日志", self)
+        self.export_button.setToolTip("将当前日志结果导出为文本文件")
+        self.export_button.clicked.connect(self._export_log)
+        button_row.addWidget(self.export_button)
         self.yes_button = PrimaryPushButton("确定", self)
         self.yes_button.clicked.connect(self.accept)
         button_row.addWidget(self.yes_button)
@@ -381,3 +392,29 @@ class ScrollableMessageBox(QDialog):
         self.setStyleSheet(
             f"QDialog {{ background: {bg}; }} QLabel {{ color: {fg}; }}"
         )
+
+    def _export_log(self) -> None:
+        """弹出目录选择窗口，将日志结果导出为文本文件。"""
+        folder = QFileDialog.getExistingDirectory(self, "选择日志保存目录")
+        if not folder:
+            return
+
+        # 文件名：弹窗标题（清理非法字符）+ 时间戳
+        safe_title = re.sub(r'[<>:"/\\|?*]', "_", self.windowTitle() or "日志结果")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(folder, f"{safe_title}_{timestamp}.txt")
+
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(self.text_browser.toPlainText())
+        except OSError as exc:
+            self._show_result_message("导出失败", f"日志导出失败:\n{exc}")
+            return
+
+        self._show_result_message("导出完成", f"日志已导出至:\n{output_path}")
+
+    def _show_result_message(self, title: str, content: str) -> None:
+        box = MessageBox(title, content, self)
+        box.yesButton.setText("确定")
+        box.cancelButton.hide()
+        box.exec()

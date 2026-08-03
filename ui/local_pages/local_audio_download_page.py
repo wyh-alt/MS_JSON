@@ -417,7 +417,11 @@ class LocalAudioDownloadPage(ScrollArea):
         self._unlock_params()
         self.progress_panel.finish()
         if result.success and not result.failed:
-            InfoBar.success("导出完成", f"成功导出 {len(result.success)} 个音频文件。", duration=4000, parent=self.window(), position=InfoBarPosition.TOP)
+            ScrollableMessageBox(
+                "导出完成",
+                f"成功导出 {len(result.success)} 个音频文件。",
+                self.window(),
+            ).exec()
             return
         lines = [f"成功: {len(result.success)} 个音频文件"]
         if result.failed:

@@ -455,17 +455,19 @@ class AudioDownloadPage(ScrollArea):
         self.progress_panel.finish()
 
         if not result.success and not result.failed:
-            InfoBar.warning("未找到有效 JSON", "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
+            ScrollableMessageBox(
+                "未找到有效 JSON",
+                "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。",
+                self.window(),
+            ).exec()
             return
 
         if result.success and not result.failed:
-            InfoBar.success(
+            ScrollableMessageBox(
                 "下载完成",
                 f"成功导出 {len(result.success)} 个音频文件。",
-                duration=4000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+                self.window(),
+            ).exec()
             return
 
         lines = [f"成功: {len(result.success)} 个音频文件"]

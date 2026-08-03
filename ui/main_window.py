@@ -392,13 +392,11 @@ class ExportPage(ScrollArea):
         self.progress_panel.finish()
 
         if not result.success and not result.failed:
-            InfoBar.warning(
+            ScrollableMessageBox(
                 "未找到有效 JSON",
                 "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+                self.window(),
+            ).exec()
             return
 
         if result.success and not result.failed:
@@ -407,17 +405,7 @@ class ExportPage(ScrollArea):
                 detail += "\n音频校准:\n" + "\n".join(
                     f"- {note}" for note in result.calibration_notes
                 )
-            if len(result.calibration_notes) > 5:
-                # 校准记录较多时用可滚动弹窗展示全部，便于核实
-                ScrollableMessageBox("导出完成", detail, self.window()).exec()
-            else:
-                InfoBar.success(
-                    "导出完成",
-                    detail,
-                    duration=6000,
-                    parent=self.window(),
-                    position=InfoBarPosition.TOP,
-                )
+            ScrollableMessageBox("导出完成", detail, self.window()).exec()
             return
 
         lines = [f"成功: {len(result.success)} 个 MIDI 文件"]
@@ -429,17 +417,8 @@ class ExportPage(ScrollArea):
             for path, reason in result.failed:
                 lines.append(f"- {os.path.basename(path)}: {reason}")
 
-        box = ScrollableMessageBox("导出结果", "\n".join(lines), self.window())
-        box.exec()
-
-        if result.success:
-            InfoBar.success(
-                "部分完成",
-                f"已导出 {len(result.success)} 个 MIDI 文件。",
-                duration=3000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+        # 结果弹窗已包含成功数等信息，不再追加“部分完成”浮动通知
+        ScrollableMessageBox("导出结果", "\n".join(lines), self.window()).exec()
 
 
 class MainWindow(FluentWindow):

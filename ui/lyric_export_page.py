@@ -401,22 +401,14 @@ class LyricExportPage(ScrollArea):
         self._unlock_params()
 
         if result.error:
-            InfoBar.error(
-                "导出失败",
-                result.error,
-                duration=4000,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-            )
+            ScrollableMessageBox("导出失败", result.error, self.window()).exec()
             return
 
-        InfoBar.success(
+        ScrollableMessageBox(
             "导出完成",
             f"段落信息已保存至：{result.output_path}",
-            duration=5000,
-            parent=self.window(),
-            position=InfoBarPosition.TOP,
-        )
+            self.window(),
+        ).exec()
 
     def _start_export(self):
         paths = self._validate_inputs()
@@ -464,7 +456,11 @@ class LyricExportPage(ScrollArea):
         self._unlock_params()
 
         if not result.success and not result.failed:
-            InfoBar.warning("未找到有效 JSON", "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。", duration=3000, parent=self.window(), position=InfoBarPosition.TOP)
+            ScrollableMessageBox(
+                "未找到有效 JSON",
+                "路径下没有包含 mnote 或 msi_melody_note 数据的有效 JSON 文件。",
+                self.window(),
+            ).exec()
             return
 
         if result.success and not result.failed:
@@ -473,17 +469,7 @@ class LyricExportPage(ScrollArea):
                 detail += "\n音频校准:\n" + "\n".join(
                     f"- {note}" for note in result.calibration_notes
                 )
-            if len(result.calibration_notes) > 5:
-                # 校准记录较多时用可滚动弹窗展示全部，便于核实
-                ScrollableMessageBox("导出完成", detail, self.window()).exec()
-            else:
-                InfoBar.success(
-                    "导出完成",
-                    detail,
-                    duration=6000,
-                    parent=self.window(),
-                    position=InfoBarPosition.TOP,
-                )
+            ScrollableMessageBox("导出完成", detail, self.window()).exec()
             return
 
         lines = [f"成功: {len(result.success)} 个歌词文件"]

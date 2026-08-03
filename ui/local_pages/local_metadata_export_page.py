@@ -252,14 +252,18 @@ class LocalMetadataExportPage(ScrollArea):
         self._unlock_params()
         self.progress_panel.finish()
         if result.error:
-            InfoBar.error("提取失败", result.error, duration=5000, parent=self.window(), position=InfoBarPosition.TOP)
+            ScrollableMessageBox("提取失败", result.error, self.window()).exec()
             return
 
         failed = result.failed or []
         resource_errors = result.resource_errors or []
         cache_hits = result.cache_hits or []
         if not failed and not resource_errors and not cache_hits:
-            InfoBar.success("提取完成", f"已导出 {result.success_count} 首曲目元数据。\n{result.excel_path}", duration=6000, parent=self.window(), position=InfoBarPosition.TOP)
+            ScrollableMessageBox(
+                "提取完成",
+                f"已导出 {result.success_count} 首曲目元数据。\n{result.excel_path}",
+                self.window(),
+            ).exec()
             return
 
         lines = [f"成功: {result.success_count} 首", f"Excel: {result.excel_path}"]

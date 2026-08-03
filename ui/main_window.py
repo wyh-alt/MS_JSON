@@ -148,10 +148,10 @@ class ExportPage(ScrollArea):
         input_row = QHBoxLayout()
         self.input_edit = DragLineEdit(input_card)
         self.input_edit.setPlaceholderText("拖拽或输入 JSON 文件/文件夹路径")
-        browse_input_btn = PushButton("浏览", input_card)
-        browse_input_btn.clicked.connect(self._browse_input)
+        self.browse_input_btn = PushButton("浏览", input_card)
+        self.browse_input_btn.clicked.connect(self._browse_input)
         input_row.addWidget(self.input_edit)
-        input_row.addWidget(browse_input_btn)
+        input_row.addWidget(self.browse_input_btn)
         input_layout.addLayout(input_row)
         layout.addWidget(input_card)
 
@@ -240,10 +240,10 @@ class ExportPage(ScrollArea):
         output_row = QHBoxLayout()
         self.output_edit = DragLineEdit(output_card)
         self.output_edit.setPlaceholderText("拖拽或选择 MIDI 输出文件夹")
-        browse_output_btn = PushButton("浏览", output_card)
-        browse_output_btn.clicked.connect(self._browse_output)
+        self.browse_output_btn = PushButton("浏览", output_card)
+        self.browse_output_btn.clicked.connect(self._browse_output)
         output_row.addWidget(self.output_edit)
-        output_row.addWidget(browse_output_btn)
+        output_row.addWidget(self.browse_output_btn)
         output_layout.addLayout(output_row)
         layout.addWidget(output_card)
 
@@ -283,6 +283,39 @@ class ExportPage(ScrollArea):
         if folder:
             self.output_edit.setText(folder)
 
+    def _param_controls(self) -> list[QWidget]:
+        """任务运行期间需要锁定的参数控件。"""
+        return [
+            self.input_edit,
+            self.browse_input_btn,
+            self.output_edit,
+            self.browse_output_btn,
+            self.tempo_checkbox,
+            self.lyrics_checkbox,
+            self.lower_octave_checkbox,
+            self.section_marker_checkbox,
+            self.exclude_rap_checkbox,
+            self.remove_non_melody_checkbox,
+            self.part_combo,
+            self.lyric_combo,
+            self.lyric_granularity_combo,
+            self.offset_spinbox,
+            self.audio_calibration_checkbox,
+        ]
+
+    def _lock_params(self) -> None:
+        """任务开始后锁定参数设置，防止运行中修改。"""
+        self._param_enabled_states = {
+            control: control.isEnabled() for control in self._param_controls()
+        }
+        for control in self._param_controls():
+            control.setEnabled(False)
+
+    def _unlock_params(self) -> None:
+        """任务完成后按锁定前的可用状态恢复参数控件。"""
+        for control, state in self._param_enabled_states.items():
+            control.setEnabled(state)
+
     def _start_export(self):
         input_path = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
@@ -321,6 +354,7 @@ class ExportPage(ScrollArea):
             return
 
         self.export_btn.setEnabled(False)
+        self._lock_params()
         self.progress_panel.start("正在扫描 JSON 文件…")
         InfoBar.info(
             "开始导出",
@@ -354,6 +388,7 @@ class ExportPage(ScrollArea):
 
     def _on_finished(self, result: ExportResult):
         self.export_btn.setEnabled(True)
+        self._unlock_params()
         self.progress_panel.finish()
 
         if not result.success and not result.failed:

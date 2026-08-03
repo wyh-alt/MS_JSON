@@ -184,10 +184,10 @@ class LocalLyricExportPage(ScrollArea):
         input_row = QHBoxLayout()
         self.input_edit = DragLineEdit(input_card)
         self.input_edit.setPlaceholderText("拖拽或选择母文件夹路径")
-        browse_input_btn = PushButton("浏览", input_card)
-        browse_input_btn.clicked.connect(self._browse_input)
+        self.browse_input_btn = PushButton("浏览", input_card)
+        self.browse_input_btn.clicked.connect(self._browse_input)
         input_row.addWidget(self.input_edit)
-        input_row.addWidget(browse_input_btn)
+        input_row.addWidget(self.browse_input_btn)
         input_layout.addLayout(input_row)
         layout.addWidget(input_card)
 
@@ -263,10 +263,10 @@ class LocalLyricExportPage(ScrollArea):
         output_row = QHBoxLayout()
         self.output_edit = DragLineEdit(output_card)
         self.output_edit.setPlaceholderText("拖拽或选择歌词输出文件夹")
-        browse_output_btn = PushButton("浏览", output_card)
-        browse_output_btn.clicked.connect(self._browse_output)
+        self.browse_output_btn = PushButton("浏览", output_card)
+        self.browse_output_btn.clicked.connect(self._browse_output)
         output_row.addWidget(self.output_edit)
-        output_row.addWidget(browse_output_btn)
+        output_row.addWidget(self.browse_output_btn)
         output_layout.addLayout(output_row)
         layout.addWidget(output_card)
 
@@ -317,6 +317,37 @@ class LocalLyricExportPage(ScrollArea):
             return None
         return parent_dir, output_dir
 
+    def _param_controls(self) -> list[QWidget]:
+        """任务运行期间需要锁定的参数控件。"""
+        return [
+            self.input_edit,
+            self.browse_input_btn,
+            self.output_edit,
+            self.browse_output_btn,
+            self.lyric_combo,
+            self.part_combo,
+            self.title_lang_combo,
+            self.artist_lang_combo,
+            self.format_combo,
+            self.char_bracket_checkbox,
+            self.word_bracket_checkbox,
+            self.offset_spinbox,
+            self.audio_calibration_checkbox,
+        ]
+
+    def _lock_params(self) -> None:
+        """任务开始后锁定参数设置，防止运行中修改。"""
+        self._param_enabled_states = {
+            control: control.isEnabled() for control in self._param_controls()
+        }
+        for control in self._param_controls():
+            control.setEnabled(False)
+
+    def _unlock_params(self) -> None:
+        """任务完成后按锁定前的可用状态恢复参数控件。"""
+        for control, state in self._param_enabled_states.items():
+            control.setEnabled(state)
+
     def _set_buttons_enabled(self, enabled: bool):
         self.export_btn.setEnabled(enabled)
         self.section_export_btn.setEnabled(enabled)
@@ -341,6 +372,7 @@ class LocalLyricExportPage(ScrollArea):
         audio_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_buttons_enabled(False)
+        self._lock_params()
         self.progress_panel.start("正在扫描母文件夹…")
         InfoBar.info("开始导出", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
@@ -364,6 +396,7 @@ class LocalLyricExportPage(ScrollArea):
         audio_calibration = self.audio_calibration_checkbox.isChecked()
 
         self._set_buttons_enabled(False)
+        self._lock_params()
         self.progress_panel.start("正在扫描母文件夹…")
         InfoBar.info("开始导出段落信息", "正在扫描母文件夹，请稍候…", duration=2000, parent=self.window(), position=InfoBarPosition.TOP)
 
@@ -382,6 +415,7 @@ class LocalLyricExportPage(ScrollArea):
 
     def _on_finished(self, result: LocalLyricResult):
         self._set_buttons_enabled(True)
+        self._unlock_params()
         if result.success and not result.failed:
             detail = f"成功导出 {len(result.success)} 个歌词文件。"
             if result.calibration_notes:
@@ -408,6 +442,7 @@ class LocalLyricExportPage(ScrollArea):
 
     def _on_section_finished(self, result: LocalSectionResult):
         self._set_buttons_enabled(True)
+        self._unlock_params()
         if result.error:
             InfoBar.error("导出失败", result.error, duration=4000, parent=self.window(), position=InfoBarPosition.TOP)
             return

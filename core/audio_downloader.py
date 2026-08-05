@@ -44,6 +44,7 @@ AudioContent = Literal[
 KeyMode = Literal["original", "male", "female"]
 OutputFormat = Literal["wav", "mp3", "m4a", "flac"]
 M4aCodec = Literal["aac", "alac"]
+Channels = Literal["stereo", "mono", "source"]
 
 AUDIO_CONTENT_LABELS: list[tuple[str, AudioContent]] = [
     ("合并伴奏（harmony+drum）", "merge_har_drum"),
@@ -71,6 +72,12 @@ OUTPUT_FORMAT_LABELS: list[tuple[str, OutputFormat]] = [
 SAMPLE_RATE_LABELS: list[tuple[str, int]] = [
     ("44100 Hz", 44100),
     ("48000 Hz", 48000),
+]
+
+CHANNEL_LABELS: list[tuple[str, Channels]] = [
+    ("立体声", "stereo"),
+    ("单声道", "mono"),
+    ("与源相同", "source"),
 ]
 
 PCM_BIT_DEPTH_LABELS: list[tuple[str, int]] = [
@@ -129,6 +136,7 @@ class AudioDownloadOptions:
     key_mode: KeyMode
     output_format: OutputFormat
     sample_rate: int
+    channels: Channels = "stereo"
     pcm_bit_depth: int = 16
     bitrate_kbps: int = 320
     m4a_codec: M4aCodec = "aac"
@@ -335,6 +343,13 @@ def _resolve_track_gain_db(options: AudioDownloadOptions) -> float | None:
     return float(options.track_gain_db)
 
 
+def _channel_layout_filter(channels: Channels) -> str | None:
+    """声道转换 filter；「与源相同」时返回 None（输出保持源声道数）。"""
+    if channels in ("stereo", "mono"):
+        return f"aformat=channel_layouts={channels}"
+    return None
+
+
 def _build_amix_expr(count: int, track_gain_db: float | None = None) -> str:
     if track_gain_db is not None:
         pre = "".join(
@@ -422,12 +437,14 @@ def _measure_loudness(
     true_peak: float,
     sample_rate: int,
     track_gain_db: float | None = None,
+    channels: Channels = "stereo",
 ) -> LoudnessMeasurement:
-    """第一遍：跑 loudnorm 分析拿到 measured_* 参数（分轨电平和重采样都提前应用）。"""
+    """第一遍：跑 loudnorm 分析拿到 measured_* 参数（分轨电平、声道转换和重采样都提前应用）。"""
     input_args: list[str] = []
     for source in sources:
         input_args.extend(["-i", str(source)])
 
+    channel_filter = _channel_layout_filter(channels)
     resample_expr = f"aresample={sample_rate}"
     loudnorm_expr = (
         f"loudnorm=I={target_lufs}:LRA={_MEASURE_LRA}:TP={true_peak}"
@@ -435,19 +452,26 @@ def _measure_loudness(
     )
 
     if len(sources) == 1:
+        # 声道转换与最终导出保持一致，保证测量的响度即最终输出响度
+        pre_chain = ",".join(
+            expr for expr in (channel_filter, resample_expr, loudnorm_expr) if expr
+        )
         args = [
             "-y",
             *input_args,
             "-af",
-            f"{resample_expr},{loudnorm_expr}",
+            pre_chain,
             "-f",
             "null",
             "-",
         ]
     else:
+        mix_pre = ",".join(
+            expr for expr in (channel_filter, resample_expr) if expr
+        )
         filter_complex = (
             f"{_build_amix_expr(len(sources), track_gain_db)}[mix];"
-            f"[mix]{resample_expr}[m2];"
+            f"[mix]{mix_pre}[m2];"
             f"[m2]{loudnorm_expr}[out]"
         )
         args = [
@@ -476,6 +500,12 @@ def _build_export_filters(
     target_lufs, limit_db = _resolve_loudness_params(options)
     chain: list[str] = []
 
+    # 声道转换置于链首（测量同样提前应用，保证响度测量与最终输出一致）；
+    # 「与源相同」时保持源声道数，不添加该 filter。
+    channel_filter = _channel_layout_filter(options.channels)
+    if channel_filter:
+        chain.append(channel_filter)
+
     # 把测量、增益、限幅统一拉到目标输出采样率，避免下游重采样引入 LUFS 漂移。
     if target_lufs is not None or limit_db is not None:
         chain.append(f"aresample={options.sample_rate}")
@@ -488,6 +518,7 @@ def _build_export_filters(
             true_peak,
             options.sample_rate,
             track_gain_db,
+            options.channels,
         )
         # 第二遍：拿 measured_i 手工算增益，纯线性 volume 偏移；
         # 不用 loudnorm 的 linear 模式——它自带的前瞻真峰限幅会在峰值触顶时压掉大动态段，

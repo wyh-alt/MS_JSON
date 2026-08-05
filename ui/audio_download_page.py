@@ -18,6 +18,7 @@ from qfluentwidgets import (
 
 from core.audio_downloader import (
     AUDIO_CONTENT_LABELS,
+    CHANNEL_LABELS,
     KEY_MODE_LABELS,
     M4A_BITRATE_LABELS,
     M4A_CODEC_LABELS,
@@ -191,6 +192,13 @@ class AudioDownloadPage(ScrollArea):
         for label, _ in SAMPLE_RATE_LABELS:
             self.sample_rate_combo.addItem(label)
         format_row.addWidget(self.sample_rate_combo)
+
+        self.channel_label = BodyLabel("声道:", output_option_card)
+        format_row.addWidget(self.channel_label)
+        self.channel_combo = create_compact_combo(output_option_card, min_width=88, max_width=108)
+        for label, _ in CHANNEL_LABELS:
+            self.channel_combo.addItem(label)
+        format_row.addWidget(self.channel_combo)
 
         self.pcm_label = BodyLabel("PCM:", output_option_card)
         format_row.addWidget(self.pcm_label)
@@ -435,6 +443,7 @@ class AudioDownloadPage(ScrollArea):
             key_mode=KEY_MODE_LABELS[self.key_combo.currentIndex()][1],
             output_format=fmt,
             sample_rate=SAMPLE_RATE_LABELS[self.sample_rate_combo.currentIndex()][1],
+            channels=CHANNEL_LABELS[self.channel_combo.currentIndex()][1],
             pcm_bit_depth=PCM_BIT_DEPTH_LABELS[self.pcm_combo.currentIndex()][1],
             bitrate_kbps=bitrate_kbps,
             m4a_codec=M4A_CODEC_LABELS[self.m4a_codec_combo.currentIndex()][1],
@@ -468,6 +477,7 @@ class AudioDownloadPage(ScrollArea):
             self.key_combo,
             self.format_combo,
             self.sample_rate_combo,
+            self.channel_combo,
             self.pcm_combo,
             self.mp3_bitrate_combo,
             self.m4a_bitrate_combo,

@@ -19,6 +19,7 @@ from qfluentwidgets import (
 
 from core.audio_downloader import (
     AUDIO_CONTENT_LABELS,
+    CHANNEL_LABELS,
     KEY_MODE_LABELS,
     M4A_BITRATE_LABELS,
     M4A_CODEC_LABELS,
@@ -181,6 +182,13 @@ class LocalAudioDownloadPage(ScrollArea):
             self.sample_rate_combo.addItem(label)
         format_row.addWidget(self.sample_rate_combo)
 
+        self.channel_label = BodyLabel("声道:", output_option_card)
+        format_row.addWidget(self.channel_label)
+        self.channel_combo = create_compact_combo(output_option_card, min_width=88, max_width=108)
+        for label, _ in CHANNEL_LABELS:
+            self.channel_combo.addItem(label)
+        format_row.addWidget(self.channel_combo)
+
         self.pcm_label = BodyLabel("PCM:", output_option_card)
         format_row.addWidget(self.pcm_label)
         self.pcm_combo = create_compact_combo(output_option_card, min_width=72, max_width=96)
@@ -283,6 +291,18 @@ class LocalAudioDownloadPage(ScrollArea):
         self._pending_params: dict | None = None
         self.input_edit.textChanged.connect(self._on_input_path_changed)
 
+        self.format_combo.currentIndexChanged.connect(self._update_format_options)
+        self.m4a_codec_combo.currentIndexChanged.connect(self._update_format_options)
+        self.loudness_checkbox.toggled.connect(self._update_loudness_controls)
+        self.limiter_checkbox.toggled.connect(self._update_limiter_controls)
+        self.content_combo.currentIndexChanged.connect(self._update_track_gain_visibility)
+        self.track_gain_checkbox.toggled.connect(self._update_track_gain_controls)
+        self._update_format_options()
+        self._update_loudness_controls()
+        self._update_limiter_controls()
+        self._update_track_gain_visibility()
+        self._update_track_gain_controls()
+
     def _scan_loader(self, path, *, progress_callback=None, cancel_check=None):
         from core.local_resolver import scan_local_parent_dir
 
@@ -334,17 +354,6 @@ class LocalAudioDownloadPage(ScrollArea):
         if self._loaded_result is not None and self._loaded_result[0] == input_path:
             return self._loaded_result[1]
         return None
-        self.format_combo.currentIndexChanged.connect(self._update_format_options)
-        self.m4a_codec_combo.currentIndexChanged.connect(self._update_format_options)
-        self.loudness_checkbox.toggled.connect(self._update_loudness_controls)
-        self.limiter_checkbox.toggled.connect(self._update_limiter_controls)
-        self.content_combo.currentIndexChanged.connect(self._update_track_gain_visibility)
-        self.track_gain_checkbox.toggled.connect(self._update_track_gain_controls)
-        self._update_format_options()
-        self._update_loudness_controls()
-        self._update_limiter_controls()
-        self._update_track_gain_visibility()
-        self._update_track_gain_controls()
 
     # --- format / loudness / limiter control logic (identical to original) ---
     def _current_content(self) -> str:
@@ -409,6 +418,7 @@ class LocalAudioDownloadPage(ScrollArea):
             key_mode=KEY_MODE_LABELS[self.key_combo.currentIndex()][1],
             output_format=fmt,
             sample_rate=SAMPLE_RATE_LABELS[self.sample_rate_combo.currentIndex()][1],
+            channels=CHANNEL_LABELS[self.channel_combo.currentIndex()][1],
             pcm_bit_depth=PCM_BIT_DEPTH_LABELS[self.pcm_combo.currentIndex()][1],
             bitrate_kbps=bitrate_kbps,
             m4a_codec=M4A_CODEC_LABELS[self.m4a_codec_combo.currentIndex()][1],
@@ -442,6 +452,7 @@ class LocalAudioDownloadPage(ScrollArea):
             self.key_combo,
             self.format_combo,
             self.sample_rate_combo,
+            self.channel_combo,
             self.pcm_combo,
             self.mp3_bitrate_combo,
             self.m4a_bitrate_combo,

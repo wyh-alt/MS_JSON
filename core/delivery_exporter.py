@@ -104,6 +104,8 @@ def _run_audio_project(
         key_mode="original",
         output_format="wav",
         sample_rate=44100,
+        # 默认立体声输出（与音频下载模块页面默认一致）
+        channels="stereo",
         # 音频下载模块页面默认：响度 -12 LUFS、限幅 -1 dBTP、分轨电平 -6 dB 均勾选
         loudness_enabled=True,
         loudness_lufs=-12.0,

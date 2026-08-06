@@ -17,6 +17,38 @@ for package in ("qfluentwidgets", "PyQt6", "librosa", "numpy", "scipy", "soundfi
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
 
+def _resolve_chocolatey_real_ffmpeg() -> str | None:
+    """沿 chocolatey\\lib 目录解析 shim 指向的真实 ffmpeg.exe。
+
+    shim 用相对路径 ..\\lib\\<包名>\\tools\\... 指向真实文件，真实文件为静态编译的
+    自包含 exe，可独立运行；递归搜索取体积最大的候选（shim 本体仅数百 KB）。
+    """
+    import glob as _glob
+
+    shim_path = None
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = directory.strip('"')
+        if not directory:
+            continue
+        candidate = os.path.join(directory, "ffmpeg.exe")
+        if os.path.isfile(candidate) and "chocolatey" in candidate.lower():
+            shim_path = candidate
+            break
+    if shim_path is None:
+        return None
+
+    lib_dir = os.path.join(os.path.dirname(os.path.dirname(shim_path)), "lib")
+    candidates = [
+        p
+        for p in _glob.glob(os.path.join(lib_dir, "ffmpeg", "**", "ffmpeg.exe"), recursive=True)
+        if os.path.isfile(p)
+    ]
+    if not candidates:
+        return None
+    # 真实 ffmpeg 体积远大于 shim，取最大的候选
+    return max(candidates, key=lambda p: os.path.getsize(p))
+
+
 def _find_real_ffmpeg() -> str:
     """在 PATH 中查找可独立运行的 ffmpeg.exe。
 
@@ -37,6 +69,12 @@ def _find_real_ffmpeg() -> str:
     for candidate in candidates:
         if "chocolatey" not in candidate.lower():
             return candidate
+
+    # PATH 中只有 Chocolatey 代理时，解析出包内真实的自包含 ffmpeg 打包
+    choco_real = _resolve_chocolatey_real_ffmpeg()
+    if choco_real:
+        print(f"使用 Chocolatey 包内的真实 ffmpeg: {choco_real}")
+        return choco_real
     if candidates:
         print(f"警告：仅找到 Chocolatey 的 ffmpeg 代理程序 {candidates[0]}，"
               "该文件打包后可能无法运行，建议安装独立版 ffmpeg 并调整 PATH 顺序。")
@@ -56,7 +94,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # torch/torchaudio 是 scipy._lib.array_api_compat 的可选适配子模块被
+    # collect_all("scipy") 拖入的；pandas 为 librosa 等可选功能依赖。
+    # 项目代码均未使用，排除可显著减小体积（torch 全家桶可达数百 MB）。
+    excludes=["torch", "torchaudio", "pandas"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

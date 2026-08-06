@@ -43,13 +43,10 @@ METADATA_HEADERS: tuple[str, ...] = (
     "女调伴奏本地",
     "鼓轨直链",
     "鼓轨本地",
-    "男调鼓轨直链",
-    "男调鼓轨本地",
-    "女调鼓轨直链",
-    "女调鼓轨本地",
 )
 
 # (JSON 字段, 子文件夹名, 无后缀时的默认扩展名)
+# 鼓轨不区分性别，仅 file_mr_drum 一个字段指向文件，不包含 drum_m/drum_w
 RESOURCE_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("album_cover_path", "专辑封面", ".jpg"),
     ("file_mr_mel_m", "男调旋律", ".m4a"),
@@ -57,8 +54,6 @@ RESOURCE_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("file_mr_har_m", "男调伴奏", ".m4a"),
     ("file_mr_har_w", "女调伴奏", ".m4a"),
     ("file_mr_drum", "鼓轨", ".m4a"),
-    ("file_mr_drum_m", "男调鼓轨", ".m4a"),
-    ("file_mr_drum_w", "女调鼓轨", ".m4a"),
 )
 
 
@@ -86,8 +81,6 @@ def _resource_basename(mr_id: int, field_name: str) -> str:
         "file_mr_mel_m": f"{mr_id}-m-mel",
         "file_mr_mel_w": f"{mr_id}-w-mel",
         "file_mr_drum": f"{mr_id}-Drum",
-        "file_mr_drum_m": f"{mr_id}-Drum",
-        "file_mr_drum_w": f"{mr_id}-Drum",
     }
     return mapping.get(field_name, str(mr_id))
 
@@ -260,10 +253,6 @@ def build_metadata_row(
         resource_locals["file_mr_har_w"],
         resource_urls["file_mr_drum"],
         resource_locals["file_mr_drum"],
-        resource_urls.get("file_mr_drum_m", ""),
-        resource_locals.get("file_mr_drum_m", ""),
-        resource_urls.get("file_mr_drum_w", ""),
-        resource_locals.get("file_mr_drum_w", ""),
     ]
     return SongMetadataRow(values=values, download_errors=errors, cache_hits=cache_hits)
 

@@ -253,17 +253,26 @@ def resolve_audio_file(url_or_path: str, json_path: str) -> Path:
     raise FileNotFoundError(f"找不到 MR 音频: {value}")
 
 
+def cached_audio_path(url: str, json_path: str, default_suffix: str = ".m4a") -> Path:
+    """计算 URL 资源在 JSON 原目录缓存中的落盘路径（不触发下载）。
+
+    缓存名 = sha256(url)[:32] + 后缀，与 download_cached_file 的落盘命名一致，
+    供音频校准等模块在下载前检查文件状态、复用同一缓存。
+    """
+    suffix = Path(url.split("?", 1)[0]).suffix or default_suffix
+    cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] + suffix
+    return Path(json_path).parent / CACHE_DIR_NAME / cache_name
+
+
 def download_cached_file(url: str, json_path: str, default_suffix: str = ".m4a") -> Path:
     """下载任意 URL 资源到 JSON 原目录缓存（.ms_json_audio_cache/），返回缓存路径。
 
     所有模块共用同一缓存：元数据提取、音频下载、音频校准等先落缓存再取用，
     命中的缓存文件直接复用，跳过重复下载。缓存名 = sha256(url)[:32] + 后缀。
     """
-    suffix = Path(url.split("?", 1)[0]).suffix or default_suffix
-    cache_dir = Path(json_path).parent / CACHE_DIR_NAME
+    cache_path = cached_audio_path(url, json_path, default_suffix)
+    cache_dir = cache_path.parent
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] + suffix
-    cache_path = cache_dir / cache_name
 
     if cache_path.is_file() and cache_path.stat().st_size > 0:
         return cache_path

@@ -1530,16 +1530,20 @@ def _prepare_song_for_export(
 
     if part_mode == "lyric_lang_split" and song.source_path:
         song = load_song_json(song.source_path, "ori")
-    if exclude_rap_sections:
-        song = exclude_rap_sections_from_song(song)
-    if remove_non_melody_notes:
-        song = exclude_non_melody_notes_from_song(song)
 
+    # 先基于完整音符校准：rap/非旋律过滤会清空 notes，若先过滤再校准，
+    # 整首 rap 等歌曲会以"无音符"失败并把失败结果写入共享校准缓存，
+    # 导致同歌曲的歌词/段落（用原始 song 校准）也命中失败结果、丢失校准。
+    # 校准结果按歌曲共享（见 core.audio_calibration），失败时导出仍继续。
     total_offset_ms, calibration, calibration_error = resolve_export_time_offset(
         song,
         time_offset_ms=time_offset_ms,
         audio_reference_calibration=audio_reference_calibration,
     )
+    if exclude_rap_sections:
+        song = exclude_rap_sections_from_song(song)
+    if remove_non_melody_notes:
+        song = exclude_non_melody_notes_from_song(song)
     song = apply_song_time_offset(song, total_offset_ms)
     return song, calibration, calibration_error
 

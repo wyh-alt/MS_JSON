@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ import numpy as np
 from core.parser import SongData
 from core.audio_downloader import (
     _CREATE_NO_WINDOW,
+    cached_audio_path,
     find_ffmpeg_executable,
     resolve_audio_file,
     resolve_mr_mel_url,
@@ -35,6 +37,22 @@ TARGET_SAMPLE_RATE = 22050
 _PCM_WAV_LOCKS: dict[str, threading.Lock] = {}
 _PCM_WAV_LOCKS_GUARD = threading.Lock()
 
+# 同一首歌的校准结果按歌曲共享：歌词/段落/MIDI 等模块各自调用
+# resolve_export_time_offset()，第一次计算后缓存，后续模块直接复用，
+# 避免各模块独立计算导致"一个带校准、一个没带"的不一致。
+# key = (音频稳定标识, JSON 父目录, 音频文件状态)；文件状态参与 key，
+# 音频下载完成/被替换后自动失效重算。
+# 成功与失败结果都缓存：校准失败对这首歌是确定性的（音频缺失、解码失败等），
+# 各模块应保持一致地视为"无校准"。失败结果带 TTL（默认 5 分钟），
+# 网络抖动等暂时性失败在下次运行时可重试恢复；成功结果无 TTL，仅随文件状态失效。
+_CALIBRATION_CACHE: dict[
+    tuple,
+    tuple[AudioCalibrationResult | None, str | None, float],
+] = {}
+_CALIBRATION_LOCKS: dict[tuple, threading.Lock] = {}
+_CALIBRATION_GUARD = threading.Lock()
+_CALIBRATION_FAILURE_TTL_S = 300.0
+
 
 @dataclass(frozen=True)
 class AudioCalibrationResult:
@@ -47,22 +65,114 @@ class AudioCalibrationResult:
     decode_source: str
 
 
+def _file_state(path: Path) -> tuple[int, int] | None:
+    """文件状态 (mtime_ns, size)；文件不存在时为 None。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _audio_file_state(
+    mel_url: str, json_path: str
+) -> tuple[str, tuple[int, int] | None]:
+    """返回 (音频稳定标识, 文件状态)；文件未就绪（本地缺失/缓存未下载）时状态为 None。
+
+    标识与 resolve_audio_file() 的解析结果对应：URL 用其本身（缓存路径由
+    cached_audio_path 计算），本地路径用实际存在的文件绝对路径。文件状态参与
+    校准缓存 key，音频下载完成或被替换后自动失效重算。
+    """
+    value = (mel_url or "").strip()
+    if value.startswith(("http://", "https://")):
+        return value, _file_state(cached_audio_path(value, json_path, ".m4a"))
+    path = Path(value)
+    if path.is_file():
+        return str(path), _file_state(path)
+    by_name = Path(json_path).parent / path.name
+    if by_name.is_file():
+        return str(by_name), _file_state(by_name)
+    return value, None
+
+
+def _calibration_lock(key: tuple) -> threading.Lock:
+    """同一首歌的并发校准串行化（锁随 key 常驻，条目数与歌曲数一致）。"""
+    with _CALIBRATION_GUARD:
+        lock = _CALIBRATION_LOCKS.setdefault(key, threading.Lock())
+    return lock
+
+
+def _cached_calibration(
+    cache_key: tuple,
+) -> tuple[AudioCalibrationResult | None, str | None] | None:
+    """读取校准缓存；失败结果超过 TTL 视为未命中（允许重试恢复）。"""
+    with _CALIBRATION_GUARD:
+        cached = _CALIBRATION_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    calibration, error, cached_at = cached
+    if calibration is None and time.monotonic() - cached_at > _CALIBRATION_FAILURE_TTL_S:
+        return None
+    return calibration, error
+
+
 def resolve_export_time_offset(
     song: SongData,
     *,
     time_offset_ms: int = 0,
     audio_reference_calibration: bool = True,
 ) -> tuple[int, AudioCalibrationResult | None, str | None]:
-    """计算导出用的总时间偏移（手动偏移 + 音频参考校准）。"""
-    calibration: AudioCalibrationResult | None = None
-    calibration_error: str | None = None
-    total_offset_ms = time_offset_ms
-    if audio_reference_calibration:
+    """计算导出用的总时间偏移（手动偏移 + 音频参考校准）。
+
+    同一首歌的校准结果按歌曲共享缓存：歌词/段落/MIDI 等模块即使独立调用
+    也得到同一偏移；成功与失败结果都缓存，音频文件状态变化后自动重算。
+    """
+    if not audio_reference_calibration:
+        return time_offset_ms, None, None
+
+    mel_url = resolve_mr_mel_url(song)
+    if not mel_url:
+        # 无旋律音频：确定性失败，不缓存，各模块一致
+        key = (song.original_key or "").strip() or "?"
+        return time_offset_ms, None, f"无法根据 original_key={key!r} 找到 file_mr_mel 音频"
+
+    stable_id, file_state = _audio_file_state(mel_url, song.source_path)
+    json_dir = str(Path(song.source_path).parent)
+    cache_key = (stable_id, json_dir, file_state)
+
+    cached = _cached_calibration(cache_key)
+    if cached is not None:
+        calibration, error = cached
+        if calibration is not None:
+            return time_offset_ms + calibration.offset_ms, calibration, None
+        return time_offset_ms, None, error
+
+    # 同歌曲的并发校准串行化，避免一个模块失败、另一个等锁重试成功后结果不一致
+    with _calibration_lock((stable_id, json_dir)):
+        # 等待锁期间音频可能已被下载/替换，按最新文件状态复查缓存
+        _, file_state_now = _audio_file_state(mel_url, song.source_path)
+        cache_key_now = (stable_id, json_dir, file_state_now)
+        cached = _cached_calibration(cache_key_now)
+        if cached is not None:
+            calibration, error = cached
+            if calibration is not None:
+                return time_offset_ms + calibration.offset_ms, calibration, None
+            return time_offset_ms, None, error
+
+        calibration: AudioCalibrationResult | None = None
+        calibration_error: str | None = None
+        total_offset_ms = time_offset_ms
         try:
             calibration = compute_audio_calibration_offset(song)
             total_offset_ms += calibration.offset_ms
         except Exception as exc:
             calibration_error = str(exc)
+        with _CALIBRATION_GUARD:
+            _CALIBRATION_CACHE[cache_key_now] = (
+                calibration,
+                calibration_error,
+                time.monotonic(),
+            )
     return total_offset_ms, calibration, calibration_error
 
 

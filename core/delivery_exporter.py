@@ -1,8 +1,12 @@
-"""交付资源一键提取：按勾选项目并行执行伴奏/MIDI/歌词/段落/交付总表导出。
+"""交付资源一键提取：按歌曲生命周期并行处理伴奏/MIDI/歌词/段落信息导出。
 
-各处理项目使用对应导出模块的默认参数；交付总表优先复用 JSON 原目录
-共用缓存（.ms_json_audio_cache/）中已生成的元数据表格（MSID 覆盖校验），
-无可用缓存时重新提取（不下载直链资源、不导歌词）。
+按歌曲工作流：每首歌固定按 伴奏合成 → MIDI处理 → 歌词处理 → 段落信息导出
+的顺序串行执行勾选项目，歌曲之间并行（默认 3 首并发）；交付总表作为整体
+步骤与歌曲循环并行，缓存表命中优先、未命中重新提取（不下载直链、不导歌词）。
+
+同一首歌的各项目共享一次音频校准（见 core.audio_calibration 的校准缓存），
+校准音频优先复用 JSON 原目录缓存，未命中才重新下载；歌词仅导出原文歌词。
+段落信息逐曲收集后统一写入 Excel。单曲某项目失败不影响该曲其他项目与其他曲目。
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ from core.lyric_exporter import (
 )
 from core.metadata_exporter import METADATA_EXCEL_NAME, export_songs_metadata
 from core.midi_exporter import export_song
-from core.parser import load_song_json
+from core.parser import SongData, load_song_json
 
 # 项目标识与显示名（PROJECT_NAMES 亦用于日志框展示）
 PROJECT_AUDIO = "audio"
@@ -54,6 +58,18 @@ SUBDIR_MIDI = "MIDI处理"
 # openpyxl 不支持并发保存同一文件，串行化两个 Excel 写入项目
 _EXCEL_LOCK = threading.Lock()
 
+# 每首歌内部固定执行顺序：伴奏 → MIDI → 歌词 → 段落（交付总表为整体步骤）
+_SONG_PROJECT_ORDER = (PROJECT_AUDIO, PROJECT_MIDI, PROJECT_LYRIC, PROJECT_SECTIONS)
+# 结果展示顺序（与日志框一致）：伴奏 → MIDI → 歌词 → 段落 → 交付总表
+_PROJECT_DISPLAY_ORDER = (
+    PROJECT_AUDIO,
+    PROJECT_MIDI,
+    PROJECT_LYRIC,
+    PROJECT_SECTIONS,
+    PROJECT_METADATA,
+)
+DEFAULT_SONG_CONCURRENCY = 3
+
 
 @dataclass
 class DeliveryProjectResult:
@@ -70,7 +86,7 @@ class DeliveryExportResult:
 
 
 class _ProgressAggregator:
-    """各项目并行报告自身进度，聚合为加权平均单一进度。
+    """各项目报告自身进度，聚合为加权平均单一进度。
 
     各项目处理同一批 JSON，曲目数相同，故各项目等权。
     """
@@ -78,10 +94,13 @@ class _ProgressAggregator:
     def __init__(self, total: int, callback: Callable[[float, str], None] | None):
         self._lock = threading.Lock()
         self._last: dict[str, float] = {}  # 每个项目最近一次完成比例 0..1
+        self._done: dict[str, int] = {}  # 每个项目已完成的歌曲数
         self._total = total
         self._cb = callback
 
     def wrap(self, name: str) -> Callable[[float, str], None]:
+        """返回按给定完成比例报告的进度回调（整体步骤如交付总表使用）。"""
+
         def report(fraction: float, message: str) -> None:
             with self._lock:
                 self._last[name] = max(0.0, min(1.0, fraction))
@@ -91,14 +110,53 @@ class _ProgressAggregator:
 
         return report
 
+    def advance(self, name: str, total_songs: int, message: str) -> None:
+        """报告该项目又完成一首歌（歌曲工作流每完成一个项目步骤调用一次）。"""
+        with self._lock:
+            done = self._done.get(name, 0) + 1
+            self._done[name] = done
+            self._last[name] = done / total_songs if total_songs else 1.0
+            overall = sum(self._last.values()) / self._total
+        if self._cb:
+            self._cb(overall * 100.0, f"[{PROJECT_NAMES[name]}] {message}")
 
-def _run_audio_project(
-    json_paths: list[str],
-    output_dir: str,
-    progress_cb: Callable[[float, str], None],
-) -> DeliveryProjectResult:
-    """合并伴奏：按音频下载模块页面默认参数（merge_har_drum / original / wav / 44100，响度限幅分轨电平均开启）。"""
-    result = DeliveryProjectResult(name=PROJECT_NAMES[PROJECT_AUDIO])
+
+class _ProjectCollector:
+    """线程安全地聚合单个项目的成功/失败/说明（歌曲 worker 并发写入）。"""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.success: list[str] = []
+        self.failed: list[tuple[str, str]] = []
+        self.notes: list[str] = []
+        self._lock = threading.Lock()
+
+    def add_success(self, paths: str | list[str]) -> None:
+        if isinstance(paths, str):
+            paths = [paths]
+        with self._lock:
+            self.success.extend(paths)
+
+    def add_failure(self, path: str, reason: str) -> None:
+        with self._lock:
+            self.failed.append((path, reason))
+
+    def add_notes(self, notes: list[str]) -> None:
+        with self._lock:
+            self.notes.extend(notes)
+
+    def result(self) -> DeliveryProjectResult:
+        with self._lock:
+            return DeliveryProjectResult(
+                name=self.name,
+                success=list(self.success),
+                failed=list(self.failed),
+                notes=list(self.notes),
+            )
+
+
+def _run_audio_for_song(song: SongData, output_dir: str) -> str:
+    """伴奏：按音频下载模块页面默认参数（merge_har_drum / original / wav / 44100，响度限幅分轨电平均开启）。"""
     options = AudioDownloadOptions(
         content="merge_har_drum",
         key_mode="original",
@@ -115,121 +173,113 @@ def _run_audio_project(
         track_gain_db=-6.0,
     )
     sub = Path(output_dir) / SUBDIR_AUDIO
-    total = len(json_paths)
-    for index, path in enumerate(json_paths, start=1):
-        progress_cb(index / total, f"正在处理: {os.path.basename(path)}")
-        try:
-            song = load_song_json(path)
-            out = export_song_audio(song, str(sub), options)
-            result.success.append(out)
-        except Exception as exc:
-            result.failed.append((path, str(exc)))
-    return result
+    return export_song_audio(song, str(sub), options)
 
 
-def _run_midi_project(
-    json_paths: list[str],
-    output_dir: str,
-    progress_cb: Callable[[float, str], None],
-) -> DeliveryProjectResult:
-    """MIDI：按 MIDI 导出模块默认参数（merge_same，校准开启）。"""
-    result = DeliveryProjectResult(name=PROJECT_NAMES[PROJECT_MIDI])
+def _run_midi_for_song(song: SongData, output_dir: str) -> tuple[list[str], list[str]]:
+    """MIDI：按 MIDI 导出模块默认参数（merge_same，校准开启），返回 (输出文件, 校准日志)。"""
     sub = Path(output_dir) / SUBDIR_MIDI
-    total = len(json_paths)
-    for index, path in enumerate(json_paths, start=1):
-        progress_cb(index / total, f"正在处理: {os.path.basename(path)}")
-        try:
-            song = load_song_json(path, "ori")
-            calibration_log: list[str] = []
-            exported = export_song(
-                song,
-                str(sub),
-                "merge_same",
-                write_tempo=False,
-                write_lyrics=True,
-                lyric_granularity="word",
-                lower_octave=True,
-                write_section_markers=False,
-                exclude_rap_sections=True,
-                remove_non_melody_notes=True,
-                time_offset_ms=0,
-                audio_reference_calibration=True,
-                calibration_log=calibration_log,
-            )
-            if calibration_log:
-                result.notes.append(f"{os.path.basename(path)}: {calibration_log[0]}")
-            result.success.extend(exported)
-        except Exception as exc:
-            result.failed.append((path, str(exc)))
-    return result
+    calibration_log: list[str] = []
+    exported = export_song(
+        song,
+        str(sub),
+        "merge_same",
+        write_tempo=False,
+        write_lyrics=True,
+        lyric_granularity="word",
+        lower_octave=True,
+        write_section_markers=False,
+        exclude_rap_sections=True,
+        remove_non_melody_notes=True,
+        time_offset_ms=0,
+        audio_reference_calibration=True,
+        calibration_log=calibration_log,
+    )
+    return exported, calibration_log
 
 
-def _run_lyric_project(
-    json_paths: list[str],
-    output_dir: str,
-    progress_cb: Callable[[float, str], None],
-) -> DeliveryProjectResult:
+def _run_lyric_for_song(song: SongData, output_dir: str) -> tuple[str, list[str]]:
     """歌词：按歌词导出模块默认参数（ksc-txt / all / 原歌词，校准开启）。"""
-    result = DeliveryProjectResult(name=PROJECT_NAMES[PROJECT_LYRIC])
     sub = Path(output_dir) / SUBDIR_LYRIC
-    total = len(json_paths)
-    for index, path in enumerate(json_paths, start=1):
-        progress_cb(index / total, f"正在处理: {os.path.basename(path)}")
-        try:
-            song = load_song_json(path, "ori")
-            calibration_log: list[str] = []
-            out = export_song_lyrics(
-                song,
-                str(sub),
-                lyric_format="ksc-txt",
-                part="all",
-                lyric_field="ori",
-                title_lang="origin",
-                artist_lang="origin",
-                time_offset_ms=0,
-                audio_reference_calibration=True,
-                calibration_log=calibration_log,
-            )
-            if calibration_log:
-                result.notes.append(f"{os.path.basename(path)}: {calibration_log[0]}")
-            result.success.append(out)
-        except Exception as exc:
-            result.failed.append((path, str(exc)))
-    return result
+    calibration_log: list[str] = []
+    out = export_song_lyrics(
+        song,
+        str(sub),
+        lyric_format="ksc-txt",
+        part="all",
+        lyric_field="ori",
+        title_lang="origin",
+        artist_lang="origin",
+        time_offset_ms=0,
+        audio_reference_calibration=True,
+        calibration_log=calibration_log,
+    )
+    return out, calibration_log
 
 
-def _run_sections_project(
-    json_paths: list[str],
+def _run_sections_for_song(song: SongData) -> list[tuple[str, str, str, str, str, str, str]]:
+    """段落：逐曲收集段落表格行（统一写 Excel 由编排层完成）。"""
+    return collect_section_export_rows(
+        song,
+        title_lang="origin",
+        artist_lang="origin",
+        time_offset_ms=0,
+        audio_reference_calibration=True,
+    )
+
+
+def _process_song(
+    path: str,
     output_dir: str,
-    progress_cb: Callable[[float, str], None],
-) -> DeliveryProjectResult:
-    """段落信息：校准开启，逐曲收集后写入 歌词段落信息及时间点.xlsx（输出目录根）。"""
-    result = DeliveryProjectResult(name=PROJECT_NAMES[PROJECT_SECTIONS])
-    all_rows: list[tuple[str, str, str, str, str, str, str]] = []
-    total = len(json_paths)
-    for index, path in enumerate(json_paths, start=1):
-        progress_cb(index / total, f"正在处理: {os.path.basename(path)}")
+    enabled: set[str],
+    collectors: dict[str, _ProjectCollector],
+    section_rows: list,
+    section_rows_lock: threading.Lock,
+    total_songs: int,
+    aggregator: _ProgressAggregator,
+) -> None:
+    """处理一首歌：按 伴奏→MIDI→歌词→段落 固定顺序串行执行勾选项目。
+
+    单项目失败记录到该项目并继续下一项目；JSON 解析失败则全部启用项目记录失败。
+    """
+    basename = os.path.basename(path)
+    try:
+        song = load_song_json(path, "ori")
+    except Exception as exc:
+        for key in _SONG_PROJECT_ORDER:
+            if key in enabled:
+                collectors[key].add_failure(path, f"JSON 解析失败: {exc}")
+        return
+
+    for key in _SONG_PROJECT_ORDER:
+        if key not in enabled:
+            continue
         try:
-            song = load_song_json(path, "ori")
-            all_rows.extend(
-                collect_section_export_rows(
-                    song,
-                    title_lang="origin",
-                    artist_lang="origin",
-                    time_offset_ms=0,
-                    audio_reference_calibration=True,
-                )
-            )
+            if key == PROJECT_AUDIO:
+                out = _run_audio_for_song(song, output_dir)
+                collectors[key].add_success(out)
+            elif key == PROJECT_MIDI:
+                outs, calibration_log = _run_midi_for_song(song, output_dir)
+                collectors[key].add_success(outs)
+                if calibration_log:
+                    collectors[key].add_notes(
+                        [f"{basename}: {calibration_log[0]}"]
+                    )
+            elif key == PROJECT_LYRIC:
+                out, calibration_log = _run_lyric_for_song(song, output_dir)
+                collectors[key].add_success(out)
+                if calibration_log:
+                    collectors[key].add_notes(
+                        [f"{basename}: {calibration_log[0]}"]
+                    )
+            elif key == PROJECT_SECTIONS:
+                rows = _run_sections_for_song(song)
+                with section_rows_lock:
+                    section_rows.extend(rows)
         except Exception as exc:
-            result.failed.append((path, str(exc)))
-    if not all_rows:
-        result.failed.append(("", "没有可导出的段落信息"))
-        return result
-    with _EXCEL_LOCK:
-        out = write_sections_excel(all_rows, output_dir)
-    result.success.append(out)
-    result.notes.append(f"共 {len(all_rows)} 段")
-    return result
+            collectors[key].add_failure(path, str(exc))
+        finally:
+            aggregator.advance(key, total_songs, f"正在处理: {basename}")
 
 
 def _collect_mr_ids(json_paths: list[str]) -> set[int]:
@@ -331,16 +381,6 @@ def _run_metadata_project(
     return result
 
 
-# 固定展示顺序：伴奏 → MIDI → 歌词 → 段落信息 → 交付总表
-_PROJECT_FUNCS: dict[str, Callable[[list[str], str, Callable], DeliveryProjectResult]] = {
-    PROJECT_AUDIO: _run_audio_project,
-    PROJECT_MIDI: _run_midi_project,
-    PROJECT_LYRIC: _run_lyric_project,
-    PROJECT_SECTIONS: _run_sections_project,
-    PROJECT_METADATA: _run_metadata_project,
-}
-
-
 def run_delivery_export(
     json_paths: list[str],
     output_dir: str,
@@ -349,36 +389,75 @@ def run_delivery_export(
     max_workers: int | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> DeliveryExportResult:
-    """并行执行勾选的处理项目并输出到 output_dir。
+    """按歌曲生命周期并行执行勾选项目并输出到 output_dir。
 
-    enabled 为 PROJECT_* 常量子集；各项目内部串行处理全部 JSON，
-    项目之间并行（ThreadPoolExecutor，最多 5 个）。单个项目抛出的
-    整体异常降级为该项目的失败记录，不影响其他项目。
+    enabled 为 PROJECT_* 常量子集。每首歌固定按 伴奏→MIDI→歌词→段落 串行执行
+    勾选的资源项目，歌曲之间并行（max_workers 为歌曲级并发数，默认 3）；
+    交付总表作为整体步骤与歌曲循环并行（不占歌曲并发槽位）。
+    单曲某项目失败不影响该曲其他项目与其他曲目。
     progress_callback(百分比 0-100, 状态文案) 由各项目进度加权聚合而来。
     """
-    tasks = [(name, fn) for name, fn in _PROJECT_FUNCS.items() if name in enabled]
+    enabled = set(enabled)
+    tasks = [key for key in _PROJECT_DISPLAY_ORDER if key in enabled]
     if not tasks:
         return DeliveryExportResult(projects=[])
 
+    song_concurrency = max(1, max_workers or DEFAULT_SONG_CONCURRENCY)
+    has_metadata = PROJECT_METADATA in enabled
     aggregator = _ProgressAggregator(len(tasks), progress_callback)
-    results: dict[str, DeliveryProjectResult] = {}
-    worker_count = min(len(tasks), max_workers or 5)
+    collectors = {key: _ProjectCollector(PROJECT_NAMES[key]) for key in tasks}
+    section_rows: list[tuple[str, str, str, str, str, str, str]] = []
+    section_rows_lock = threading.Lock()
+
+    worker_count = song_concurrency + (1 if has_metadata else 0)
+    metadata_result: DeliveryProjectResult | None = None
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="delivery"
     ) as pool:
         futures = {
-            pool.submit(fn, json_paths, output_dir, aggregator.wrap(name)): name
-            for name, fn in tasks
+            pool.submit(
+                _process_song,
+                path,
+                output_dir,
+                enabled,
+                collectors,
+                section_rows,
+                section_rows_lock,
+                len(json_paths),
+                aggregator,
+            ): "song"
+            for path in json_paths
         }
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                results[name] = future.result()
-            except Exception as exc:
-                # 整项目失败降级，不影响其他项目
-                results[name] = DeliveryProjectResult(
-                    name=PROJECT_NAMES[name], failed=[("", str(exc))]
+        if has_metadata:
+            futures[
+                pool.submit(
+                    _run_metadata_project,
+                    json_paths,
+                    output_dir,
+                    aggregator.wrap(PROJECT_METADATA),
                 )
+            ] = PROJECT_METADATA
 
-    projects = [results[name] for name, _ in tasks]
+        for future in as_completed(futures):
+            kind = futures[future]
+            if kind == PROJECT_METADATA:
+                # 单曲 worker 内部已隔离异常，不抛整体异常
+                metadata_result = future.result()
+
+        # 全部歌曲任务完成后统一写段落 Excel
+        if PROJECT_SECTIONS in enabled and section_rows:
+            try:
+                with _EXCEL_LOCK:
+                    out = write_sections_excel(section_rows, output_dir)
+                collectors[PROJECT_SECTIONS].add_success(out)
+                collectors[PROJECT_SECTIONS].add_notes([f"共 {len(section_rows)} 段"])
+            except Exception as exc:
+                collectors[PROJECT_SECTIONS].add_failure("", str(exc))
+
+    projects = []
+    for key in tasks:
+        if key == PROJECT_METADATA:
+            projects.append(metadata_result or collectors[key].result())
+        else:
+            projects.append(collectors[key].result())
     return DeliveryExportResult(projects=projects)

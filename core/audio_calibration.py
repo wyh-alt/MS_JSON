@@ -11,7 +11,11 @@ from pathlib import Path
 
 import numpy as np
 
-from core.parser import SongData
+from core.parser import (
+    SongData,
+    exclude_non_melody_notes_from_song,
+    exclude_rap_sections_from_song,
+)
 from core.audio_downloader import (
     _CREATE_NO_WINDOW,
     cached_audio_path,
@@ -21,9 +25,20 @@ from core.audio_downloader import (
 )
 
 CALIBRATION_ANALYZE_MS = 30_000
+# 分析窗逐步扩展步长：长静音前奏的旋律音频（如 1080 起音在 45.39s）在
+# 30s 窗口内无能量会误判 0ms 起音，需扩展窗口找到真实起音；
+# 全部窗口均无能量才判定为异常静音。
+ANALYZE_WINDOW_STEPS_MS = (30_000, 60_000, 120_000, 240_000)
+ENERGY_PRESENCE_RMS_MIN = 1e-5
 HOP_LENGTH = 512
 FRAME_LENGTH = 2048
 ENERGY_RISE_RATIO = 0.04
+# 异常旋律音频检测：能量包络几乎恒定的音频（单一频段/无实际内容，如整段
+# 恒定音）会被起音检测误判为"音频从 0ms 开始"。正常旋律音频的能量起伏大
+# （实测 RMS 变异系数 0.36~1.78、帧 RMS 波峰因数 5~11），恒定音
+# 变异系数趋近 0、波峰因数趋近 1。任一指标低于阈值即判定异常并跳过校准。
+CONSTANT_ENERGY_CV_THRESHOLD = 0.05
+MIN_RMS_CREST_FACTOR = 2.0
 ATTACK_WINDOW_FRAMES = 20
 ATTACK_DURATION_THRESHOLD_MS = 300
 FAST_ATTACK_RATIOS = (0.18, 0.35, 0.45)
@@ -208,12 +223,29 @@ def first_note_start_ms(song: SongData) -> int | None:
     return min(note.start for note in song.notes)
 
 
+def _has_exportable_melody(song: SongData) -> bool:
+    """过滤 rap 与非旋律音符后是否仍有可导出的旋律音符。
+
+    整首 rap 或疑似无实际音高的歌曲过滤后无音符，MIDI 不会产出；
+    这类歌曲没有旋律可对齐，校准无意义且匹配不可靠（假起音可能匹配到
+    rap 段音符产生错误偏移），所有模块应一致地跳过校准。
+    """
+    filtered = exclude_rap_sections_from_song(song)
+    filtered = exclude_non_melody_notes_from_song(filtered)
+    return bool(filtered.notes)
+
+
 def compute_audio_calibration_offset(song: SongData) -> AudioCalibrationResult:
     """将首个可感知旋律音对齐到对应 MIDI 音符，跳过音频前的无效 MIDI。"""
     mel_url = resolve_mr_mel_url(song)
     if not mel_url:
         key = (song.original_key or "").strip() or "?"
         raise ValueError(f"无法根据 original_key={key!r} 找到 file_mr_mel 音频")
+
+    if not _has_exportable_melody(song):
+        raise ValueError(
+            "歌曲为整首rap或无有效旋律(无音高),跳过校准"
+        )
 
     midi_first_ms = first_note_start_ms(song)
     if midi_first_ms is None:
@@ -260,26 +292,51 @@ def detect_onset_times_ms(audio_path: str) -> list[int]:
     return _analyze_attack_envelope(audio_path).attack_markers_ms
 
 
-def _analyze_attack_envelope(audio_path: str) -> _AttackEnvelope:
-    y, sr = _load_mono_audio_segment(audio_path, CALIBRATION_ANALYZE_MS)
-    if y.size == 0:
-        raise ValueError(f"音频为空: {audio_path}")
+def _load_energy_envelope(audio_path: str) -> tuple[np.ndarray, int, np.ndarray, np.ndarray]:
+    """逐步扩展分析窗加载音频并计算帧 RMS，直到窗口内检测到能量。
 
+    返回 (y, sr, rms, times_ms)。长静音前奏的旋律音频（如起音在 45.39s 的
+    1080）在 30s 窗口内无能量，自动扩展窗口；全部窗口均无能量才抛异常。
+    """
     try:
         import librosa
     except ImportError as exc:
         raise RuntimeError("音频校准需要安装 librosa，请执行: pip install librosa") from exc
 
-    rms = librosa.feature.rms(
-        y=y,
-        frame_length=FRAME_LENGTH,
-        hop_length=HOP_LENGTH,
-    )[0]
-    times = librosa.frames_to_time(
-        np.arange(len(rms)),
-        sr=sr,
-        hop_length=HOP_LENGTH,
-    ) * 1000
+    for max_ms in ANALYZE_WINDOW_STEPS_MS:
+        y, sr = _load_mono_audio_segment(audio_path, max_ms)
+        if y.size == 0:
+            raise ValueError(f"音频为空: {audio_path}")
+        rms = librosa.feature.rms(
+            y=y,
+            frame_length=FRAME_LENGTH,
+            hop_length=HOP_LENGTH,
+        )[0]
+        if float(rms.max()) > ENERGY_PRESENCE_RMS_MIN:
+            times = librosa.frames_to_time(
+                np.arange(len(rms)),
+                sr=sr,
+                hop_length=HOP_LENGTH,
+            ) * 1000
+            return y, sr, rms, times
+    # 全部扩展窗口内均无能量
+    raise ValueError("异常旋律音频:前段无音频能量(静音),跳过校准")
+
+
+def _analyze_attack_envelope(audio_path: str) -> _AttackEnvelope:
+    y, sr, rms, times = _load_energy_envelope(audio_path)
+
+    # 异常旋律音频：能量包络恒定（单一频段/无实际内容，如 10780 整段恒定音）
+    # 无真实起音，起音检测会把"恒定能量从 0ms 开始"误判为首音。正常旋律
+    # 音频的能量起伏大（实测 RMS 变异系数 0.36~1.78、帧 RMS 波峰因数
+    # 5~11），恒定音变异系数趋近 0、波峰因数趋近 1。
+    rms_mean = float(rms.mean())
+    energy_cv = float(rms.std() / rms_mean)
+    crest_factor = float(rms.max() / rms_mean)
+    if energy_cv < CONSTANT_ENERGY_CV_THRESHOLD or crest_factor < MIN_RMS_CREST_FACTOR:
+        raise ValueError(
+            "异常旋律音频:能量包络恒定(单一频段或无实际内容),跳过校准"
+        )
 
     rise_threshold = float(rms.max()) * ENERGY_RISE_RATIO
     rise_indices = np.flatnonzero(rms >= rise_threshold)

@@ -20,7 +20,6 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import audio_calibration as ac
-from core.audio_calibration import AudioCalibrationResult
 from core.delivery_exporter import (
     PROJECT_AUDIO,
     PROJECT_LYRIC,
@@ -158,8 +157,9 @@ def main():
           == ["audio", "midi", "lyric", "sections"])
     check("MIDI 仍成功 3 首", len(midi_p.success) == 3)
 
-    # ── 4. 整首 rap：校准用完整音符，MIDI 失败后校准仍缓存可用 ──
-    # 先验证 _prepare_song_for_export 的顺序：校准先于 rap/非旋律过滤执行。
+    # ── 4. 整首 rap：所有模块一致跳过校准，MIDI 不产出 ──────
+    # 整首 rap（过滤 rap + 非旋律后无音符）没有旋律可对齐：
+    # 校准判定直接跳过（无校准），MIDI 导出随后因无音符失败。
     rap_song = SongData(
         source_path="x/rap.json",
         mr_id=9,
@@ -168,6 +168,21 @@ def main():
         notes=[Note(start=100, end=500, key=60, is_part_a=True, is_part_b=False)],
         sections=[SongSection(name="rap", start=0, end=1000, seq=0)],
     )
+    check("整首 rap：无有效旋律判定", not ac._has_exportable_melody(rap_song))
+    check("普通歌曲：有效旋律判定通过", ac._has_exportable_melody(make_song(1)))
+
+    # 真实链路：整首 rap 的校准判定直接跳过（不尝试匹配），失败结果进缓存，
+    # 歌词/段落随后调用拿到一致的无校准结果。
+    ac._CALIBRATION_CACHE.clear()
+    ac._CALIBRATION_LOCKS.clear()
+    with patch("core.audio_calibration.resolve_mr_mel_url", return_value="x/rap.mel.m4a"):
+        r = ac.resolve_export_time_offset(rap_song)  # MIDI/歌词/段落共用
+        r2 = ac.resolve_export_time_offset(rap_song)  # 共享缓存
+    check("整首 rap：校准跳过(无偏移)", r[0] == 0, f"got {r}")
+    check("整首 rap：原因明确", r[2] is not None and "整首rap" in r[2], f"got {r[2]}")
+    check("整首 rap：缓存共享一致", r2[0] == 0 and r2[2] == r[2])
+
+    # MIDI 内部：校准先于过滤执行（顺序不变），过滤后导出音符为空
     received_note_count: dict[str, int] = {}
 
     def fake_resolve(song, *, time_offset_ms=0, audio_reference_calibration=True):
@@ -180,30 +195,9 @@ def main():
             exclude_rap_sections=True, remove_non_melody_notes=True,
             time_offset_ms=0, audio_reference_calibration=True,
         )
-    check("整首 rap：校准收到完整音符", received_note_count["count"] == 1,
+    check("整首 rap：校准先于过滤执行", received_note_count["count"] == 1,
           f"got {received_note_count}")
     check("整首 rap：过滤后导出音符为空", len(out_song.notes) == 0)
-
-    # 真实校准链路：MIDI 内部校准（完整音符）成功写入缓存，
-    # 即使导出随后因无音符失败，歌词/段落仍能命中成功校准。
-    ac._CALIBRATION_CACHE.clear()
-    ac._CALIBRATION_LOCKS.clear()
-    fake_cal = AudioCalibrationResult(
-        offset_ms=2000, matched_audio_ms=1000, matched_midi_ms=1000,
-        midi_first_note_ms=100, match_count=1, audio_source="a", decode_source="d",
-    )
-    with (
-        patch("core.audio_calibration.resolve_mr_mel_url", return_value="x/rap.mel.m4a"),
-        patch("core.audio_calibration.compute_audio_calibration_offset", return_value=fake_cal),
-    ):
-        _prepare_song_for_export(
-            rap_song, "merge_same",
-            exclude_rap_sections=True, remove_non_melody_notes=True,
-            time_offset_ms=0, audio_reference_calibration=True,
-        )  # 导出前校准已成功缓存（完整音符）
-        r = ac.resolve_export_time_offset(rap_song)  # 模拟歌词/段落随后调用
-    check("MIDI 失败后校准仍缓存可用", r[0] == 2000, f"got {r}")
-    check("缓存为成功结果而非失败", r[1] is not None and r[2] is None)
 
     # ── 5. MIDI 失败（如整首 rap 无输出）：歌词/段落照常 ───────
     call_log.clear()

@@ -39,7 +39,9 @@ def main():
     app = QApplication(sys.argv)
     setTheme(Theme.AUTO)
 
-    icon_path = os.path.join(_app_dir(), "icon.ico")
+    icon_path = os.path.join(_app_dir(), "icon.png")
+    if not os.path.exists(icon_path):
+        icon_path = os.path.join(_app_dir(), "icon.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 

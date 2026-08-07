@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-datas = [("icon.ico", ".")]
+datas = [("icon.png", "."), ("icon.ico", ".")]
 binaries = []
 hiddenimports = ["mido.backends.backend_mido", "mido.backends.amidi", "openpyxl"]
 

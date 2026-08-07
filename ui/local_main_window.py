@@ -12,7 +12,9 @@ class LocalMainWindow(FluentWindow):
         self.resize(1000, 700)
         self.setMinimumSize(1000, 700)
 
-        icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icon.ico")
+        icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icon.png")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icon.ico")
         if os.path.exists(icon_path):
             from PyQt6.QtGui import QIcon
             self.setWindowIcon(QIcon(icon_path))
